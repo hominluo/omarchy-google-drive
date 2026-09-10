@@ -45,6 +45,25 @@ mount.
 Credentials belong entirely to rclone. This plugin never reads or writes your
 client ID, client secret, or OAuth token.
 
+## Requirements
+
+| | Needed for | Package |
+|---|---|---|
+| Omarchy with the Quickshell plugin runtime | the widget itself | — |
+| `rclone` (1.66+) | all syncing and mounting; `bisync --resync-mode` and `--conflict-resolve` | `rclone` |
+| `python3` | the backend | `python` |
+| A systemd **user** session | the sync timer and browse mount units | — |
+| `findmnt` | detecting mounts and stale endpoints | `util-linux` |
+| `fusermount3` | unmounting the browse view | `fuse3` |
+| `nautilus` | the **Open** buttons, via `uwsm-app` | `nautilus` |
+| `omarchy-launch-browser` | opening Drive in a browser | Omarchy |
+
+Only `rclone` is strictly required. Without `fuse3` the browse mount is
+unavailable; without `nautilus` the Open buttons do nothing. Syncing itself
+needs neither.
+
+An authenticated rclone Google Drive remote is also required — see below.
+
 ## Setting up rclone
 
 The plugin drives rclone but never configures it, so do this first. It is a
