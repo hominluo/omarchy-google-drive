@@ -214,6 +214,14 @@ logged out: `sudo loginctl enable-linger "$USER"`.
 - The interpreter baked into those units is `/usr/bin/python3` on purpose: a
   systemd user unit doesn't inherit the PATH that mise, pyenv or asdf put their
   shims on, and those paths move on every version bump.
+- The marketplace security baseline reports four capabilities for this plugin,
+  and it is worth being precise about which are the plugin's. Three of them —
+  package management, privilege, and remote build — are detected from commands
+  in *this README* that **you** run once: installing `rclone`, optionally
+  enabling systemd lingering, and cloning the repo to work on it. The plugin
+  itself does none of those. The fourth, service management, is genuinely its
+  own: it writes and enables the two systemd user units above, which is how
+  syncing survives a reboot.
 
 ### Diagnostics
 
