@@ -282,13 +282,20 @@ changes to a QML *component* like the icon need `omarchy restart shell`.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE), and [NOTICE.md](NOTICE.md) for attributions.
 
-Began as a rewrite of [omarchy-google-drive](https://github.com/wesleycole/omarchy-google-drive)
-by Wesley Cole, which takes the FUSE-mount approach, and keeps parts of its QML
-scaffolding. Both are MIT.
+This began as a rewrite of [omarchy-google-drive](https://github.com/wesleycole/omarchy-google-drive)
+by Wesley Cole, which takes the FUSE-mount approach to the same problem. The
+sync engine is new, but a substantial amount of that project's Quickshell widget
+scaffolding survives here, so its copyright is retained alongside mine in the
+LICENSE. Both projects are MIT.
 
-Not affiliated with Google. "Google Drive" is a trademark of Google LLC.
+The Drive mark is drawn from Google's own artwork, which
+[Wikimedia Commons](https://commons.wikimedia.org/wiki/File:Google_Drive_icon_(2020).svg)
+records as public domain for copyright and trademarked. It identifies the
+service this plugin connects to, and is recoloured to your theme rather than
+Google's palette. Google Drive is a trademark of Google LLC; this plugin is not
+affiliated with, endorsed by, or sponsored by Google.
 
 ---
 

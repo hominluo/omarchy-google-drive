@@ -1,11 +1,6 @@
 MIT License
 
 Copyright (c) 2026 Homin Luo
-
-This plugin began as a rewrite of omarchy-google-drive
-(https://github.com/wesleycole/omarchy-google-drive) and retains parts of its
-QML widget scaffolding and several helper functions:
-
 Copyright (c) 2026 Wesley Cole
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
