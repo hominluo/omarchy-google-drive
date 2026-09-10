@@ -34,6 +34,7 @@ STATE_PATH = STATE_DIR / "state.json"
 LOG_PATH = STATE_DIR / "sync.log"
 WORKDIR = STATE_DIR / "workdir"
 LOCK_PATH = STATE_DIR / "sync.lock"
+UNIT_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")) / "systemd" / "user"
 
 SERVICE = "omarchy-gdrive-sync.service"
 BROWSE_SERVICE = "omarchy-gdrive-browse.service"
@@ -186,6 +187,87 @@ def patch_state(**fields: Any) -> dict[str, Any]:
 def service_active() -> bool:
   code, out, _ = run(["systemctl", "--user", "is-active", SERVICE], timeout=6)
   return out.strip() in ("active", "activating") or code == 0
+
+
+def systemd_quote(value: str) -> str:
+  """Quote a value for a systemd Exec= line; paths here contain spaces."""
+  return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def unit_sources(remote: str, folder: Path, mount: Path) -> dict[str, str]:
+  helper = systemd_quote(str(Path(__file__).resolve()))
+  # Pin the system interpreter. A systemd user unit does not inherit the
+  # PATH that version managers (mise, pyenv, asdf) install their shims on, and
+  # those paths move on every version bump — resolving python3 from PATH here
+  # bakes a path that silently stops existing.
+  python = "/usr/bin/python3" if Path("/usr/bin/python3").exists() else (shutil.which("python3") or "/usr/bin/python3")
+  return {
+    SERVICE: f"""[Unit]
+Description=Omarchy Google Drive folder sync (rclone bisync)
+Documentation=https://rclone.org/bisync/
+
+[Service]
+Type=oneshot
+ExecStart={python} {helper} run --remote {systemd_quote(remote)} --folder {systemd_quote(str(folder))}
+# A first baseline over a large folder can take a while; bisync holds its own
+# lock, and Type=oneshot keeps the timer from starting a second run.
+TimeoutStartSec=7200
+# Stay out of the way of interactive work.
+Nice=10
+IOSchedulingClass=idle
+""",
+    TIMER: """[Unit]
+Description=Sync the Omarchy Google Drive folder
+
+[Timer]
+OnBootSec=2min
+# Measured from when the last run finished, so a long sync never overlaps the
+# next trigger. The interval drop-in overrides this.
+OnUnitInactiveSec=10min
+AccuracySec=30s
+Unit=omarchy-gdrive-sync.service
+
+[Install]
+WantedBy=timers.target
+""",
+    BROWSE_SERVICE: f"""[Unit]
+Description=Omarchy Google Drive browse mount (read-only, on demand)
+Documentation=https://rclone.org/commands/rclone_mount/
+
+[Service]
+# The mount command returns once the FUSE mount is live; the rclone daemon it
+# starts is deliberately session-independent, so the unit stays active to hold
+# the ExecStop that tears it down.
+Type=oneshot
+RemainAfterExit=yes
+ExecStart={python} {helper} mount --remote {systemd_quote(remote)} --mount {systemd_quote(str(mount))}
+ExecStop={python} {helper} unmount --mount {systemd_quote(str(mount))}
+TimeoutStartSec=180
+
+[Install]
+WantedBy=default.target
+""",
+  }
+
+
+def ensure_units(remote: str, folder: Path, mount: Path) -> bool:
+  """Write the plugin's own systemd units. Called before anything that needs
+  them, so a fresh `omarchy plugin add` works with no manual setup. Rewrites
+  only on change, and never touches the interval drop-in beside the timer."""
+  UNIT_DIR.mkdir(parents=True, exist_ok=True)
+  changed = False
+  for name, text in unit_sources(remote, folder, mount).items():
+    path = UNIT_DIR / name
+    try:
+      current = path.read_text(encoding="utf-8")
+    except OSError:
+      current = ""
+    if current != text:
+      path.write_text(text, encoding="utf-8")
+      changed = True
+  if changed:
+    run(["systemctl", "--user", "daemon-reload"], timeout=30)
+  return changed
 
 
 def unit_enabled(unit: str) -> bool:
@@ -614,6 +696,7 @@ def status_payload(remote_value: str, folder_value: str, mount_value: str) -> di
     "browseStale": False,
     "browseEnabled": False,
     "timerEnabled": False,
+    "unitsInstalled": False,
     "lastResult": str(state.get("lastResult") or ""),
     "lastFinishedTs": int(state.get("finishedTs") or 0),
     "lastDurationSec": float(state.get("durationSec") or 0),
@@ -632,6 +715,7 @@ def status_payload(remote_value: str, folder_value: str, mount_value: str) -> di
   payload["browseStale"] = browse_state[1] and not browse_state[3]
   payload["browseEnabled"] = unit_enabled(BROWSE_SERVICE)
   payload["timerEnabled"] = timer_enabled()
+  payload["unitsInstalled"] = (UNIT_DIR / SERVICE).exists() and (UNIT_DIR / TIMER).exists()
   payload["syncing"] = service_active()
   payload["localBytes"] = directory_bytes(folder) if folder.is_dir() else 0
 
@@ -740,9 +824,18 @@ def write_timer_interval(minutes: int) -> None:
   run(["systemctl", "--user", "daemon-reload"], timeout=25)
 
 
+def units_from_args(args: argparse.Namespace) -> None:
+  ensure_units(
+    normalize_remote(args.remote),
+    normalize_path(args.folder, "~/Google Drive"),
+    normalize_path(args.mount, "~/GDrive-Browse"),
+  )
+
+
 def cmd_browse(args: argparse.Namespace) -> None:
   """Enable/disable the browse mount as a unit, so the choice survives a
   reboot instead of living only in this session's mount table."""
+  units_from_args(args)
   action = ["enable", "--now"] if args.enable else ["disable", "--now"]
   code, out, err = run(["systemctl", "--user", *action, BROWSE_SERVICE], timeout=90)
   if code != 0:
@@ -751,6 +844,7 @@ def cmd_browse(args: argparse.Namespace) -> None:
 
 
 def cmd_timer(args: argparse.Namespace) -> None:
+  units_from_args(args)
   if args.interval:
     write_timer_interval(args.interval)
   action = ["enable", "--now"] if args.enable else ["disable", "--now"]
@@ -763,8 +857,8 @@ def cmd_timer(args: argparse.Namespace) -> None:
 def cmd_sync(args: argparse.Namespace) -> None:
   """Hand the run to systemd so it survives a shell restart and cannot
   overlap with the timer's own run."""
-  unit = SERVICE
-  command = ["systemctl", "--user", "start", unit]
+  units_from_args(args)
+  command = ["systemctl", "--user", "start", SERVICE]
   if args.resync:
     patch_state(forceResync=True)
   code, out, err = run(command + ["--no-block"], timeout=20)
@@ -795,6 +889,9 @@ def parser() -> argparse.ArgumentParser:
 
   sync = commands.add_parser("sync")
   sync.add_argument("--resync", action="store_true")
+  sync.add_argument("--remote", default="gdrive")
+  sync.add_argument("--folder", default="~/Google Drive")
+  sync.add_argument("--mount", default="~/GDrive-Browse")
 
   runner = commands.add_parser("run")
   runner.add_argument("--remote", default="gdrive")
@@ -817,12 +914,18 @@ def parser() -> argparse.ArgumentParser:
   browse_group = browse.add_mutually_exclusive_group(required=True)
   browse_group.add_argument("--enable", action="store_true")
   browse_group.add_argument("--disable", action="store_true")
+  browse.add_argument("--remote", default="gdrive")
+  browse.add_argument("--folder", default="~/Google Drive")
+  browse.add_argument("--mount", default="~/GDrive-Browse")
 
   timer = commands.add_parser("timer")
   group = timer.add_mutually_exclusive_group(required=True)
   group.add_argument("--enable", action="store_true")
   group.add_argument("--disable", action="store_true")
   timer.add_argument("--interval", type=int, default=0)
+  timer.add_argument("--remote", default="gdrive")
+  timer.add_argument("--folder", default="~/Google Drive")
+  timer.add_argument("--mount", default="~/GDrive-Browse")
 
   return result
 

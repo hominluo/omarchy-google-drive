@@ -89,6 +89,16 @@ Item {
     return ["python3", helperPath, command]
   }
 
+  // sync/timer/browse write the systemd units, so they need the configured
+  // paths to bake into them.
+  function unitArgs(command) {
+    return baseArgs(command).concat([
+      "--remote", remoteName,
+      "--folder", configuredFolder,
+      "--mount", configuredMount
+    ])
+  }
+
   function refresh() {
     if (statusProcess.running || helperPath === "") return
     statusProcess.command = baseArgs("status").concat([
@@ -193,7 +203,7 @@ Item {
   function syncNow(resync) {
     if (busy || syncing) return
     note("Starting sync…")
-    var args = baseArgs("sync")
+    var args = unitArgs("sync")
     if (resync === true) args.push("--resync")
     runControl(args, function () {
       root.syncing = true
@@ -206,7 +216,7 @@ Item {
     if (busy) return
     _desiredTimer = enabled ? 1 : 0
     note(enabled ? "Enabling automatic sync…" : "Pausing automatic sync…")
-    var args = baseArgs("timer").concat([enabled ? "--enable" : "--disable"])
+    var args = unitArgs("timer").concat([enabled ? "--enable" : "--disable"])
     if (enabled) args = args.concat(["--interval", String(syncIntervalMin)])
     runControl(args, function () { root.refresh() })
   }
@@ -216,7 +226,7 @@ Item {
     var turningOn = !browseActive
     _desiredBrowse = turningOn ? 1 : 0
     note(turningOn ? "Mounting browse folder…" : "Unmounting browse folder…")
-    runControl(baseArgs("browse").concat([turningOn ? "--enable" : "--disable"]),
+    runControl(unitArgs("browse").concat([turningOn ? "--enable" : "--disable"]),
                function () { root.refresh() })
   }
 
