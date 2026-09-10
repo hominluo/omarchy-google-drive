@@ -1,0 +1,76 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.hominluo.google-drive",
+  "name": "Google Drive",
+  "version": "1.0.0",
+  "author": "Homin Luo",
+  "license": "MIT",
+  "description": "Two-way sync a chosen subset of Google Drive into a real on-disk folder, with an optional on-demand browse mount for everything else.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Google Drive",
+    "description": "Pick which Drive folders live on disk, sync them both ways on a timer, and browse the rest on demand.",
+    "category": "Files",
+    "aliases": [
+      "google-drive",
+      "gdrive",
+      "drive",
+      "drive-sync"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "remoteName": "gdrive",
+      "folderPath": "~/Google Drive",
+      "browseMountPath": "~/GDrive-Browse",
+      "syncIntervalMin": 10,
+      "refreshIntervalSec": 30
+    },
+    "schema": [
+      {
+        "key": "remoteName",
+        "type": "string",
+        "label": "rclone remote name",
+        "defaultValue": "gdrive",
+        "description": "The rclone remote that connects to Google Drive. Do not include the trailing colon."
+      },
+      {
+        "key": "folderPath",
+        "type": "path",
+        "label": "Synced folder",
+        "defaultValue": "~/Google Drive",
+        "description": "Real on-disk folder holding the Drive folders you select."
+      },
+      {
+        "key": "browseMountPath",
+        "type": "path",
+        "label": "Browse mount folder",
+        "defaultValue": "~/GDrive-Browse",
+        "description": "Read-only on-demand FUSE view of the whole Drive, for reaching what is not synced."
+      },
+      {
+        "key": "syncIntervalMin",
+        "type": "integer",
+        "label": "Sync interval (minutes)",
+        "min": 1,
+        "max": 1440,
+        "step": 1,
+        "defaultValue": 10
+      },
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Status refresh (seconds)",
+        "min": 10,
+        "max": 3600,
+        "step": 5,
+        "defaultValue": 30
+      }
+    ]
+  }
+}
