@@ -1,152 +1,133 @@
-# Google Drive for Omarchy
-
-Keep a **real on-disk folder** two-way synced with the Google Drive folders you
-choose — and never download the ones you don't.
+<h1 align="center">Google Drive</h1>
 
 <p align="center">
-  <img src="preview.png" alt="The Google Drive panel: storage summary, sync controls, and a per-folder picker" width="440">
+  Selective two-way Google Drive sync for the <a href="https://omarchy.org">Omarchy</a> bar —
+  the folders you pick live on disk, the rest never leave the cloud.
 </p>
 
 <p align="center">
-  <img src="docs/bar.png" alt="The widget in the Omarchy bar" width="620">
+  <img src="docs/bar.png" alt="The widget in the Omarchy bar" height="26">
 </p>
+
+<p align="center">
+  <img src="preview.png" alt="The Google Drive panel: storage, sync controls, and the folder picker" width="420">
+</p>
+
+<p align="center">
+  <a href="#install">Install</a> ·
+  <a href="#connect-google-drive">Connect Drive</a> ·
+  <a href="#the-panel">The panel</a> ·
+  <a href="#settings">Settings</a> ·
+  <a href="#how-it-syncs">How it syncs</a> ·
+  <a href="#after-a-reboot">After a reboot</a>
+</p>
+
+---
 
 Google ships no Drive client for Linux. The usual workaround is an rclone FUSE
 mount, but a mount means your files aren't really on disk: they vanish when
-you're offline, and every app pays a network round trip. A full sync fixes that
-but drags your entire Drive down.
+you're offline and every app pays a network round trip. A full sync fixes that
+and drags your entire account down with it.
 
-This plugin does neither by default. You tick the folders worth having locally;
-they become ordinary files that any app can open offline. Everything else stays
-untouched in the cloud, still reachable through an optional read-only browse
-mount.
+This does neither by default. Tick the folders worth having locally and they
+become ordinary files that any program can open offline. Everything you didn't
+tick is never listed, let alone downloaded — still one click away in a
+read-only browse mount when you need it.
 
-| | rclone mount | Full sync | This plugin |
+|  | rclone mount | Full sync | This |
 |---|---|---|---|
-| Files really on disk | No | Yes | Yes, for what you pick |
-| Works offline | Only what's cached | Yes | Yes |
-| Downloads everything | No | Yes | No |
-| Survives a shell restart | Sync dies with the bar | — | systemd timer keeps going |
+| Files really on disk | no | yes | the ones you pick |
+| Works offline | only what's cached | yes | yes |
+| Downloads everything | no | yes | no |
+| Keeps running if the bar restarts | no | — | yes, systemd timer |
 
-## How it works
+## Install
 
-- **Selection → filters.** The folders you tick become an rclone
-  `--filters-file`. Everything else is excluded, so bisync never even lists it.
-- **Sync.** A systemd user timer runs [`rclone bisync`](https://rclone.org/bisync/)
-  on an interval. bisync holds its own lock, and `Type=oneshot` stops runs from
-  overlapping.
-- **Baseline.** bisync needs a baseline (`--resync`) before its first run, and
-  again whenever the filter set changes. The backend records a hash of the
-  filters file after each good run and re-baselines automatically when it
-  differs — so ticking a new folder just works instead of erroring out.
-- **Google-native files** (Docs, Sheets, Slides) are skipped with
-  `--drive-skip-gdocs`. They have no real file to store; open them in a browser.
-
-Credentials belong entirely to rclone. This plugin never reads or writes your
-client ID, client secret, or OAuth token.
-
-## Requirements
-
-| | Needed for | Package |
-|---|---|---|
-| Omarchy with the Quickshell plugin runtime | the widget itself | — |
-| `rclone` (1.66+) | all syncing and mounting; `bisync --resync-mode` and `--conflict-resolve` | `rclone` |
-| `python3` | the backend | `python` |
-| A systemd **user** session | the sync timer and browse mount units | — |
-| `findmnt` | detecting mounts and stale endpoints | `util-linux` |
-| `fusermount3` | unmounting the browse view | `fuse3` |
-| `nautilus` | the **Open** buttons, via `uwsm-app` | `nautilus` |
-| `omarchy-launch-browser` | opening Drive in a browser | Omarchy |
-
-Only `rclone` is strictly required. Without `fuse3` the browse mount is
-unavailable; without `nautilus` the Open buttons do nothing. Syncing itself
-needs neither.
-
-An authenticated rclone Google Drive remote is also required — see below.
-
-## Setting up rclone
-
-The plugin drives rclone but never configures it, so do this first. It is a
-one-time setup.
-
-### 1. Install rclone
-
-```sh
+```bash
 omarchy pkg add rclone fuse3
+omarchy plugin add https://github.com/hominluo/omarchy-google-drive.git --enable
+omarchy bar move io.github.hominluo.google-drive --after omarchy.tray
 ```
 
-`fuse3` is only needed for the optional browse mount.
+The widget appears in the bar immediately and downloads nothing until you pick
+a folder. Until a Drive remote exists it simply reports what's missing.
 
-### 2. Create your own Google OAuth client
+| Needed for | Package |
+|---|---|
+| Everything — syncing and mounting (rclone 1.66+) | `rclone` |
+| The backend | `python` |
+| Unmounting the browse view | `fuse3` |
+| Detecting mounts and dead endpoints | `util-linux` |
+| The **Open** buttons | `nautilus` |
+| The bar widget, and a systemd **user** session | Omarchy with the Quickshell bar |
 
-rclone's shared Google Drive OAuth client is being retired during 2026, and it
-is heavily rate-limited in the meantime. Make your own — it is free and takes a
-few minutes.
+Only `rclone` is strictly required. Without `fuse3` the browse mount is
+unavailable; without `nautilus` the Open buttons do nothing. Syncing needs
+neither.
 
-1. Open the [Google Cloud console](https://console.cloud.google.com/) and create
-   a project (or pick an existing one).
+To remove it, see [Uninstall](#uninstall).
+
+## Connect Google Drive
+
+The plugin drives rclone but never configures it, so do this once. It never
+reads or writes your client ID, secret, or OAuth token — rclone owns all of it.
+
+### 1. Make your own Google OAuth client
+
+rclone's shared Drive client is being retired during 2026 and is heavily
+rate-limited meanwhile. Your own is free and takes a few minutes.
+
+1. In the [Google Cloud console](https://console.cloud.google.com/), create a
+   project or pick one.
 2. **APIs & Services → Library →** enable the **Google Drive API**.
-3. **APIs & Services → OAuth consent screen →** choose **External**. Fill in the
-   app name and your email.
-   **Publish the app to Production.** Left in *Testing*, Google expires your
-   refresh token after **7 days** and the sync silently stops.
-   Personal use does not require Google's verification review.
+3. **APIs & Services → OAuth consent screen →** choose **External**, fill in an
+   app name and your email, then **publish the app to Production**.
+   Left in *Testing*, Google expires your refresh token after **7 days** and
+   syncing stops silently. Personal use needs no verification review.
 4. **APIs & Services → Credentials → Create credentials → OAuth client ID →**
-   application type **Desktop app**. Copy the **client ID** and **client secret**.
+   application type **Desktop app**. Copy the client ID and client secret.
 
-Full detail lives in rclone's own
-[client ID guide](https://rclone.org/drive/#making-your-own-client-id).
+rclone's [client ID guide](https://rclone.org/drive/#making-your-own-client-id)
+has the same steps with screenshots.
 
-### 3. Create the remote
+### 2. Create the remote
 
-Non-interactive, in one line — this opens a browser for consent:
-
-```sh
+```bash
 rclone config create gdrive drive \
   client_id=YOUR_CLIENT_ID.apps.googleusercontent.com \
   client_secret=YOUR_CLIENT_SECRET \
   scope=drive
 ```
 
-Answer `y` to the web-browser question. Google will warn that the app is
-unverified — that is expected for a personal client; choose **Advanced → Go to
-… (unsafe)**.
+Answer `y` to the browser question. Google warns that the app is unverified —
+expected for a personal client: **Advanced → Go to … (unsafe)**.
 
-`scope=drive` gives read/write to your whole Drive, which is what a two-way sync
-needs. Use `drive.readonly` if you only ever want to pull down.
+`scope=drive` is read/write over your whole Drive, which two-way sync needs. Use
+`drive.readonly` to only ever pull down.
 
-Prefer a guided walkthrough? Plain `rclone config` asks the same questions.
+Prefer being asked? Plain `rclone config` walks the same questions.
 
-### 4. Verify
+### 3. Check it
 
-```sh
-rclone listremotes      # should list gdrive:
-rclone about gdrive:    # should print your storage usage
+```bash
+rclone listremotes      # lists gdrive:
+rclone about gdrive:    # prints your storage usage
 ```
 
-If `rclone about` prints numbers, you are done.
+Numbers from `rclone about` mean you're done. Open the panel and tick a folder.
 
-> **Migrating an existing `gdrive:` off rclone's shared client:** run
-> `rclone config`, choose **Edit existing remote → gdrive**, enter your own
-> client ID and secret, keep the scope, and replace the token when prompted.
+> Already have a `gdrive:` on rclone's shared client? Run `rclone config`,
+> **Edit existing remote → gdrive**, enter your own ID and secret, keep the
+> scope, and replace the token when prompted.
 
-## Install
+## The panel
 
-```sh
-omarchy plugin add https://github.com/hominluo/omarchy-google-drive.git --enable
-```
-
-The widget appears in the right section of the bar. Open the panel and tick the
-folders you want on disk — nothing is downloaded until you do.
-
-If rclone or the remote is missing, the panel says so and changes nothing.
-
-## Panel
+Left click opens it, right click refreshes.
 
 | Key | Action |
 |---|---|
 | `j` / `k`, arrows | Move through folders |
-| Enter / Space | Toggle the selected folder, or the auto-sync switch |
+| Enter / Space | Toggle the folder under the cursor, or the auto-sync switch |
 | `s` | Sync now |
 | `a` | Toggle automatic sync |
 | `b` | Mount / unmount the browse view |
@@ -155,19 +136,29 @@ If rclone or the remote is missing, the panel says so and changes nothing.
 | `c` | Clean up folders you stopped syncing |
 | Escape | Close |
 
-Left click opens the panel, right click refreshes. Right-clicking **Browse all**
-opens the mounted browse folder instead of toggling it.
+**Browse all** mounts your whole Drive read-only at `~/GDrive-Browse` without
+downloading it — for reaching something you never synced. Right-click it to open
+the folder instead of toggling it.
+
+Unticking a folder only *stops syncing* it. The files stay, and the panel says
+how much room they take. **Clean up** deletes them, but only after
+`rclone check --one-way` proves every local file still exists in Drive; a folder
+that fails the check is left alone and reported. Nothing is deleted on an
+unverified path.
+
+Google-native files — Docs, Sheets, Slides — are skipped. They have no real file
+to store; open them in a browser.
 
 ## Settings
 
-```sh
+```bash
 omarchy bar set io.github.hominluo.google-drive remoteName gdrive
 omarchy bar set io.github.hominluo.google-drive folderPath "$HOME/Google Drive"
 omarchy bar set io.github.hominluo.google-drive browseMountPath "$HOME/GDrive-Browse"
 omarchy bar set io.github.hominluo.google-drive syncIntervalMin 10 --json
 ```
 
-| Setting | Default | Description |
+| Setting | Default | What it is |
 |---|---:|---|
 | `remoteName` | `gdrive` | rclone remote name, no trailing colon |
 | `folderPath` | `~/Google Drive` | The real on-disk synced folder |
@@ -175,111 +166,132 @@ omarchy bar set io.github.hominluo.google-drive syncIntervalMin 10 --json
 | `syncIntervalMin` | `10` | Written to a systemd timer drop-in |
 | `refreshIntervalSec` | `30` | How often the panel re-reads status |
 
-## Deleting local copies
+Numeric values need `--json`; strings don't.
 
-Unticking a folder only *stops syncing* it — the files stay on disk, and the
-panel reports how much space they use. **Clean up** deletes them, but only after
-`rclone check --one-way` proves every local file still exists in Drive. If that
-check fails for a folder it is left alone and reported. Nothing is ever deleted
-on an unverified path.
+## How it syncs
 
-## Surviving a reboot
+[`rclone bisync`](https://rclone.org/bisync/) does the work.
 
-Everything that should come back does, and none of it depends on the bar
-running:
+- **Your selection becomes a filter.** Ticked folders compile to an rclone
+  `--filters-file`; everything else is excluded, so bisync never even lists it.
+- **A systemd user timer runs it**, not the bar — syncing survives a shell
+  restart. `Type=oneshot` plus bisync's own lock stops runs overlapping.
+- **Baselines happen automatically.** bisync needs `--resync` before its first
+  run and again whenever the filters change. The backend hashes the filters file
+  after each good run and re-baselines itself when it differs, so ticking a new
+  folder just works instead of aborting.
+- **Conflicts** resolve to the newer file.
 
-- **Sync** — `omarchy-gdrive-sync.timer` is `WantedBy=timers.target`, rearmed at
-  login, firing 2 minutes after boot and every 10 minutes after that.
-- **Browse mount** — `omarchy-gdrive-browse.service` is
-  `WantedBy=default.target`. The panel's Browse toggle enables/disables the unit
-  rather than just mounting, so whichever state you left it in is what you get
-  back.
-- **Stale mounts** — a FUSE mount whose daemon died (power loss, crash) stays in
-  the mount table and answers every call with `ENOTCONN`. The backend probes
-  liveness instead of trusting the table, reports it, and lazily detaches the
-  corpse before remounting.
-- **Orphaned bisync lock** — a run killed mid-flight leaves a `.lck` that blocks
-  every later run. It is cleared automatically, but only after confirming no
-  `rclone bisync` process is actually alive.
-- **Network not up yet** — a sync that fails purely because the network isn't
-  ready is recorded as `offline`, not `error`. The bar shows "Waiting for
-  network" and the next tick picks it up.
+## After a reboot
 
-These are per-user units, so they run once you log in. To keep syncing while
-logged out:
+Everything that should come back does, and none of it needs the bar running.
 
-```sh
-sudo loginctl enable-linger "$USER"
-```
+- **Sync** — the timer is `WantedBy=timers.target`, rearmed at login, firing 2
+  minutes after boot and every 10 minutes after.
+- **Browse mount** — its own unit is `WantedBy=default.target`, and the panel's
+  Browse toggle enables or disables that unit rather than only mounting. The
+  state you left it in is the state you get back.
+- **A mount whose daemon died** — power loss leaves a FUSE mount in the mount
+  table answering every call with `ENOTCONN`. Liveness is probed rather than
+  trusting the table, and the dead mount is detached before remounting.
+- **A bisync lock orphaned by a hard reboot** would block every later run. It's
+  cleared automatically, but only once no `rclone bisync` process is alive.
+- **Booting before the network** — a sync that fails only for that is recorded
+  as `offline`, not an error. The bar says "Waiting for network" and the next
+  tick picks it up.
 
-## Diagnostics
+Both units are per-user, so they start when you log in. To keep syncing while
+logged out: `sudo loginctl enable-linger "$USER"`.
 
-```sh
+## Notes
+
+- Plugins run unsandboxed inside `omarchy-shell`. This one installs no packages,
+  asks for no elevated privileges, and never touches rclone's configuration.
+  Every command is executed as an argument array, never an interpolated shell
+  string.
+- It writes two systemd user units, and only when you first enable sync or the
+  browse mount. Both are listed under [Uninstall](#uninstall).
+- The interpreter baked into those units is `/usr/bin/python3` on purpose: a
+  systemd user unit doesn't inherit the PATH that mise, pyenv or asdf put their
+  shims on, and those paths move on every version bump.
+
+### Diagnostics
+
+```bash
 omarchy-shell io.github.hominluo.google-drive status
 python3 ~/.config/omarchy/plugins/io.github.hominluo.google-drive/gdrive-sync.py status | jq
 
-systemctl --user status omarchy-gdrive-sync.service
-systemctl --user status omarchy-gdrive-browse.service
 systemctl --user list-timers omarchy-gdrive-sync.timer
+systemctl --user status omarchy-gdrive-sync.service omarchy-gdrive-browse.service
 journalctl --user -u omarchy-gdrive-sync.service -n 50
 
-tail -40 ~/.local/state/omarchy-gdrive/sync.log     # rclone's own log
-cat ~/.local/state/omarchy-gdrive/filters.txt       # generated selection
-jq . ~/.local/state/omarchy-gdrive/state.json       # last run result
+tail -40 ~/.local/state/omarchy-gdrive/sync.log   # rclone's own log
+cat ~/.local/state/omarchy-gdrive/filters.txt     # your selection, compiled
+jq . ~/.local/state/omarchy-gdrive/state.json     # last run result
+```
 
-# Prove the boot path without rebooting
+Prove the boot path without rebooting:
+
+```bash
 systemctl --user stop omarchy-gdrive-browse.service omarchy-gdrive-sync.timer
 systemctl --user start default.target timers.target
 ```
 
-Force a fresh baseline (safe — bisync builds a superset, it does not blindly
-delete):
+Force a fresh baseline — safe, bisync builds a superset rather than deleting:
 
-```sh
+```bash
 python3 ~/.config/omarchy/plugins/io.github.hominluo.google-drive/gdrive-sync.py run --resync
 ```
 
-## State
+### Uninstall
 
-```
-~/.local/state/omarchy-gdrive/
-  selection.json   folders you picked
-  filters.txt      generated rclone filter rules
-  state.json       last run result + filters hash
-  sync.log         rclone bisync log
-  workdir/         bisync's own listings
-~/.config/systemd/user/omarchy-gdrive-sync.{service,timer}
-~/.config/systemd/user/omarchy-gdrive-sync.timer.d/interval.conf
-~/.config/systemd/user/omarchy-gdrive-browse.service
-```
-
-## Security
-
-Omarchy plugins run unsandboxed as your user. This one installs no packages,
-asks for no elevated privileges, and never touches rclone's config. Every
-command is executed as an argument array, never an interpolated shell string.
-
-## Removing
-
-```sh
-python3 ~/.config/omarchy/plugins/io.github.hominluo.google-drive/gdrive-sync.py timer --disable
-python3 ~/.config/omarchy/plugins/io.github.hominluo.google-drive/gdrive-sync.py browse --disable
+```bash
 systemctl --user disable --now omarchy-gdrive-sync.timer omarchy-gdrive-browse.service
-rm ~/.config/systemd/user/omarchy-gdrive-sync.{service,timer}
-rm ~/.config/systemd/user/omarchy-gdrive-browse.service
+rm -f ~/.config/systemd/user/omarchy-gdrive-sync.{service,timer}
+rm -f ~/.config/systemd/user/omarchy-gdrive-browse.service
 rm -rf ~/.config/systemd/user/omarchy-gdrive-sync.timer.d
 systemctl --user daemon-reload
-omarchy plugin remove io.github.hominluo.google-drive --yes
+omarchy plugin remove io.github.hominluo.google-drive
 ```
 
-Your synced folder, the rclone remote, and anything in Drive are left alone.
+Your synced folder, the rclone remote, and everything in Drive are left alone.
+Delete `~/.local/state/omarchy-gdrive/` to drop the plugin's own state too.
 
-## Credits
+## Development
 
-Began as a rewrite of [omarchy-google-drive](https://github.com/wesleycole/omarchy-google-drive)
-by Wesley Cole, which takes the FUSE-mount approach, and retains parts of its
-QML widget scaffolding. Both are MIT licensed.
+```bash
+git clone https://github.com/hominluo/omarchy-google-drive.git \
+  ~/.config/omarchy/plugins/io.github.hominluo.google-drive
+omarchy-shell shell rescanPlugins
+omarchy plugin enable io.github.hominluo.google-drive
+```
+
+Saving a file under `~/.config/omarchy/plugins/` hot-reloads the plugin, though
+changes to a QML *component* like the icon need `omarchy restart shell`.
+`omarchy plugin validate .` checks the manifest.
+
+| File | What it is |
+|---|---|
+| `manifest.json` | plugin declaration and the settings schema |
+| `gdrive-sync.py` | the backend: selection, filters, bisync, mounts, units |
+| `BarWidget.qml` | the bar icon and its IPC handlers |
+| `Panel.qml` | the panel: stats, controls, folder picker |
+| `Service.qml` | process plumbing between the panel and the backend |
+| `GoogleDriveIcon.qml` | the Drive mark, drawn to Google's geometry in your theme |
+| `Model.js` | parsing and formatting helpers |
 
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+Began as a rewrite of [omarchy-google-drive](https://github.com/wesleycole/omarchy-google-drive)
+by Wesley Cole, which takes the FUSE-mount approach, and keeps parts of its QML
+scaffolding. Both are MIT.
+
+Not affiliated with Google. "Google Drive" is a trademark of Google LLC.
+
+---
+
+<p align="center">
+  Built by <a href="https://x.com/hominluo">@hominluo</a>
+</p>
