@@ -3,6 +3,8 @@
 <p align="center">
   Selective two-way Google Drive sync for the <a href="https://omarchy.org">Omarchy</a> bar —
   the folders you pick live on disk, the rest never leave the cloud.
+<br>
+  <sub>by <a href="https://x.com/hominluo">@hominluo</a></sub>
 </p>
 
 <p align="center">
@@ -308,5 +310,8 @@ affiliated with, endorsed by, or sponsored by Google.
 ---
 
 <p align="center">
-  Built by <a href="https://x.com/hominluo">@hominluo</a>
+  Built by <a href="https://x.com/hominluo">@hominluo</a> ·
+  <a href="https://github.com/hominluo">GitHub</a> ·
+  <a href="https://github.com/hominluo/omarchy-google-drive/issues">Issues</a> ·
+  <a href="https://github.com/hominluo/omarchy-google-drive/releases">Releases</a>
 </p>
