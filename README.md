@@ -278,12 +278,15 @@ omarchy plugin enable io.github.hominluo.google-drive
 
 Saving a file under `~/.config/omarchy/plugins/` hot-reloads the plugin, though
 changes to a QML *component* like the icon need `omarchy restart shell`.
-`omarchy plugin validate .` checks the manifest.
+`omarchy plugin validate .` checks the manifest, and
+`python3 -m unittest discover -s tests -t .` runs the backend's tests (they use a
+fake `rclone`, so nothing touches Drive).
 
 | File | What it is |
 |---|---|
 | `manifest.json` | plugin declaration and the settings schema |
 | `gdrive-sync.py` | the backend: selection, filters, bisync, mounts, units |
+| `tests/` | filesystem-safety tests for the backend |
 | `BarWidget.qml` | the bar icon and its IPC handlers |
 | `Panel.qml` | the panel: stats, controls, folder picker |
 | `Service.qml` | process plumbing between the panel and the backend |

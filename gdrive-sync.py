@@ -20,7 +20,9 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -52,9 +54,9 @@ def clean_text(value: str, limit: int = 400) -> str:
   return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def run(command: list[str], timeout: float = 20) -> tuple[int, str, str]:
+def run(command: list[str], timeout: float = 20, pass_fds: tuple[int, ...] = ()) -> tuple[int, str, str]:
   try:
-    done = subprocess.run(command, check=False, capture_output=True, text=True, timeout=timeout)
+    done = subprocess.run(command, check=False, capture_output=True, text=True, timeout=timeout, pass_fds=pass_fds)
   except FileNotFoundError as error:
     return 127, "", str(error)
   except subprocess.TimeoutExpired as error:
@@ -93,13 +95,110 @@ def read_json(path: Path, fallback: Any) -> Any:
     return fallback
 
 
+def open_owned_dir(path: Path) -> int:
+  """Open a directory we own, refusing a symlink standing in its place.
+  Every write below happens relative to a descriptor from here, so another
+  process racing the pathname cannot redirect it."""
+  path.mkdir(parents=True, exist_ok=True, mode=0o700)
+  try:
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+  except OSError as error:
+    if error.errno in (errno.ELOOP, errno.ENOTDIR):
+      raise RuntimeError(f"{path} is not a plain directory; refusing to write there") from error
+    raise
+  info = os.fstat(fd)
+  if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+    os.close(fd)
+    raise RuntimeError(f"{path} is not a directory owned by you; refusing to write there")
+  return fd
+
+
+def write_atomic(path: Path, text: str, mode: int = 0o600) -> None:
+  """Replace `path` with `text` without resolving a pathname twice: an
+  unpredictable O_EXCL|O_NOFOLLOW temp inside the verified parent, fsync,
+  then a rename relative to that same directory descriptor."""
+  dfd = open_owned_dir(path.parent)
+  try:
+    for _ in range(32):
+      tmp = f".{path.name}.{secrets.token_hex(8)}.tmp"
+      try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, mode, dir_fd=dfd)
+        break
+      except FileExistsError:
+        continue
+    else:
+      raise RuntimeError(f"could not create a temporary file beside {path}")
+    try:
+      info = os.fstat(fd)
+      if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1:
+        raise RuntimeError(f"unexpected file at {path.parent / tmp}; refusing to write")
+      handle = os.fdopen(fd, "w", encoding="utf-8")
+    except BaseException:
+      os.close(fd)
+      _unlink_quiet(tmp, dfd)
+      raise
+    try:
+      with handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+      os.replace(tmp, path.name, src_dir_fd=dfd, dst_dir_fd=dfd)
+      os.fsync(dfd)
+    except BaseException:
+      _unlink_quiet(tmp, dfd)
+      raise
+  finally:
+    os.close(dfd)
+
+
+def _unlink_quiet(name: str, dir_fd: int) -> None:
+  try:
+    os.unlink(name, dir_fd=dir_fd)
+  except OSError:
+    pass
+
+
+def open_lock_file(path: Path):
+  """A lock file that is created O_NOFOLLOW and checked to be our own
+  regular file before anything flocks it."""
+  dfd = open_owned_dir(path.parent)
+  try:
+    fd = os.open(path.name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dfd)
+  except OSError as error:
+    if error.errno == errno.ELOOP:
+      raise RuntimeError(f"{path} is a symlink; refusing to lock through it") from error
+    raise
+  finally:
+    os.close(dfd)
+  info = os.fstat(fd)
+  if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+    os.close(fd)
+    raise RuntimeError(f"{path} is not a regular file owned by you")
+  return os.fdopen(fd, "r+")
+
+
+def remove_tree_contents(dfd: int, dev: int) -> None:
+  """Empty the directory behind `dfd` relative to that descriptor: symlinks
+  are unlinked rather than followed, names are never re-resolved from the
+  root, and a second filesystem is never crossed."""
+  with os.scandir(dfd) as scan:
+    entries = [(entry.name, entry.is_dir(follow_symlinks=False)) for entry in scan]
+  for name, is_dir in entries:
+    if not is_dir:
+      os.unlink(name, dir_fd=dfd)
+      continue
+    child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dfd)
+    try:
+      if os.fstat(child).st_dev != dev:
+        raise RuntimeError(f"{name} is on another filesystem; refusing to remove it")
+      remove_tree_contents(child, dev)
+    finally:
+      os.close(child)
+    os.rmdir(name, dir_fd=dfd)
+
+
 def write_json(path: Path, payload: Any) -> None:
-  path.parent.mkdir(parents=True, exist_ok=True)
-  tmp = path.with_suffix(path.suffix + ".tmp")
-  with tmp.open("w", encoding="utf-8") as handle:
-    json.dump(payload, handle, indent=2, sort_keys=True)
-    handle.write("\n")
-  os.replace(tmp, path)
+  write_atomic(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
 # ---------------------------------------------------------------- selection
@@ -165,8 +264,7 @@ def sync_filters_file(selection: dict[str, Any]) -> bool:
     current = ""
   if current == desired:
     return False
-  FILTERS_PATH.parent.mkdir(parents=True, exist_ok=True)
-  FILTERS_PATH.write_text(desired, encoding="utf-8")
+  write_atomic(FILTERS_PATH, desired)
   return True
 
 
@@ -254,7 +352,6 @@ def ensure_units(remote: str, folder: Path, mount: Path) -> bool:
   """Write the plugin's own systemd units. Called before anything that needs
   them, so a fresh `omarchy plugin add` works with no manual setup. Rewrites
   only on change, and never touches the interval drop-in beside the timer."""
-  UNIT_DIR.mkdir(parents=True, exist_ok=True)
   changed = False
   for name, text in unit_sources(remote, folder, mount).items():
     path = UNIT_DIR / name
@@ -263,7 +360,7 @@ def ensure_units(remote: str, folder: Path, mount: Path) -> bool:
     except OSError:
       current = ""
     if current != text:
-      path.write_text(text, encoding="utf-8")
+      write_atomic(path, text, mode=0o644)
       changed = True
   if changed:
     run(["systemctl", "--user", "daemon-reload"], timeout=30)
@@ -540,10 +637,10 @@ def do_run(remote_value: str, folder_value: str, force_resync: bool) -> int:
   remote = normalize_remote(remote_value)
   folder = normalize_path(folder_value, "~/Google Drive")
   rclone = rclone_bin()
-  STATE_DIR.mkdir(parents=True, exist_ok=True)
-  WORKDIR.mkdir(parents=True, exist_ok=True)
+  os.close(open_owned_dir(STATE_DIR))
+  os.close(open_owned_dir(WORKDIR))
 
-  lock = LOCK_PATH.open("w")
+  lock = open_lock_file(LOCK_PATH)
   try:
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
   except OSError as error:
@@ -771,7 +868,9 @@ def cmd_select(args: argparse.Namespace) -> None:
 
 def cmd_cleanup(args: argparse.Namespace) -> None:
   """Delete local copies of deselected folders, but only after proving the
-  files still exist on Drive. Nothing is removed on a failed check."""
+  files still exist on Drive. Nothing is removed on a failed check, and the
+  check and the removal share one open directory descriptor, so whatever the
+  name points at by the time the check finishes is never what gets deleted."""
   remote = normalize_remote(args.remote)
   folder = normalize_path(args.folder, "~/Google Drive")
   rclone = rclone_bin()
@@ -791,21 +890,47 @@ def cmd_cleanup(args: argparse.Namespace) -> None:
   removed: list[str] = []
   freed = 0
   refused: list[dict[str, str]] = []
-  for name in targets:
-    local_dir = folder / name
-    if not local_dir.is_dir():
-      continue
-    code, out, err = run(
-      [rclone, "check", str(local_dir), f"{remote}:{name}", "--one-way", "--drive-skip-gdocs"],
-      timeout=1800,
-    )
-    if code != 0:
-      refused.append({"name": name, "reason": clean_text(err or out or "verification failed")})
-      continue
-    size = local.get(name, 0)
-    shutil.rmtree(local_dir, ignore_errors=False)
-    removed.append(name)
-    freed += size
+  folder_fd = open_owned_dir(folder)
+  try:
+    folder_dev = os.fstat(folder_fd).st_dev
+    for name in targets:
+      try:
+        dfd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=folder_fd)
+      except OSError:
+        continue  # gone, or no longer a plain directory
+      try:
+        info = os.fstat(dfd)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_dev != folder_dev:
+          refused.append({"name": name, "reason": "not a plain folder owned by you"})
+          continue
+        identity = (info.st_dev, info.st_ino)
+        # rclone reads through the descriptor, so it verifies exactly the
+        # directory emptied below, whatever the name resolves to meanwhile.
+        fd_path = f"/proc/self/fd/{dfd}"
+        code, out, err = run(
+          [rclone, "check", fd_path, f"{remote}:{name}", "--one-way", "--drive-skip-gdocs"],
+          timeout=1800,
+          pass_fds=(dfd,),
+        )
+        if code != 0:
+          reason = (err or out or "verification failed").replace(fd_path, str(folder / name))
+          refused.append({"name": name, "reason": clean_text(reason)})
+          continue
+        try:
+          remove_tree_contents(dfd, folder_dev)
+          current = os.stat(name, dir_fd=folder_fd, follow_symlinks=False)
+          if (current.st_dev, current.st_ino) != identity:
+            raise RuntimeError("folder changed during cleanup")
+          os.rmdir(name, dir_fd=folder_fd)
+        except (OSError, RuntimeError) as error:
+          refused.append({"name": name, "reason": clean_text(str(error))})
+          continue
+      finally:
+        os.close(dfd)
+      removed.append(name)
+      freed += local.get(name, 0)
+  finally:
+    os.close(folder_fd)
 
   print(json.dumps({"ok": not refused, "removed": removed, "freedBytes": freed, "refused": refused}))
 
@@ -813,13 +938,12 @@ def cmd_cleanup(args: argparse.Namespace) -> None:
 def write_timer_interval(minutes: int) -> None:
   """Override the shipped cadence with a drop-in, leaving the unit itself alone."""
   value = max(1, min(1440, int(minutes)))
-  drop_dir = Path.home() / ".config" / "systemd" / "user" / (TIMER + ".d")
-  drop_dir.mkdir(parents=True, exist_ok=True)
-  (drop_dir / "interval.conf").write_text(
+  write_atomic(
+    UNIT_DIR / (TIMER + ".d") / "interval.conf",
     "# Generated by the Omarchy Google Drive widget.\n"
     "[Timer]\n"
     f"OnUnitInactiveSec={value}min\n",
-    encoding="utf-8",
+    mode=0o644,
   )
   run(["systemctl", "--user", "daemon-reload"], timeout=25)
 
