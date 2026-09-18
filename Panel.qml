@@ -387,7 +387,7 @@ Panel {
           }
 
           Column {
-            visible: drive.staleBytes > 0
+            visible: drive.staleBytes > 0 || drive.staleCount > 0
             width: parent.width
             spacing: Style.space(6)
 

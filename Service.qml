@@ -35,6 +35,7 @@ Item {
 
   property var folders: []
   property double staleBytes: 0
+  property int staleCount: 0
   property int rootFileCount: 0
   property double rootFileBytes: 0
   property bool foldersLoading: false
@@ -164,6 +165,7 @@ Item {
     }
     folders = parsed.folders
     staleBytes = parsed.staleBytes
+    staleCount = Number(parsed.staleCount || 0)
     rootFileCount = Number(parsed.rootFileCount || 0)
     rootFileBytes = Number(parsed.rootFileBytes || 0)
     rootFiles = parsed.rootFiles !== false
@@ -234,7 +236,7 @@ Item {
   }
 
   function cleanupStale() {
-    if (busy || staleBytes <= 0) return
+    if (busy || (staleBytes <= 0 && staleCount <= 0)) return
     note("Verifying against Drive before deleting…")
     runControl(baseArgs("cleanup").concat([
       "--remote", remoteName, "--folder", configuredFolder

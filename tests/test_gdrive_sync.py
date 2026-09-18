@@ -354,7 +354,7 @@ class RemoteFoldersTests(TempDirCase):
     rclone = self.fake(b'[{"Name":"b"},{"Name":"A"},{"Name":"bad\\nname"},{"Name":"a/b"},{"Name":" lead"},{"Size":7},{"Name":""}]')
     with contextlib.redirect_stderr(io.StringIO()):
       names, error = mod.remote_folders(rclone, "gdrive")
-    self.assertEqual((names, error), (["A", "b"], ""))
+    self.assertEqual((names, error), ([" lead", "A", "b"], ""))
 
   def test_too_many_folders_is_refused_whole(self):
     rclone = self.fake(("[" + ",".join('{"Name":"f%d"}' % i for i in range(mod.MAX_LIST_ENTRIES + 1)) + "]").encode())
@@ -388,9 +388,9 @@ class RemoteFoldersTests(TempDirCase):
 
 class NameValidatorTests(unittest.TestCase):
   def test_table(self):
-    for good in ("Docs", "a b.c", "x" * mod.MAX_NAME_BYTES, "naïve", "日本語"):
+    for good in ("Docs", "a b.c", " lead", "trail ", "x" * mod.MAX_NAME_BYTES, "naïve", "日本語"):
       self.assertTrue(mod.valid_drive_name(good), good)
-    for bad in ("", " x", "x ", ".", "..", "a/b", "a\nb", "a\rb", "a\x00b", "a\x7fb", "x" * (mod.MAX_NAME_BYTES + 1),
+    for bad in ("", "   ", ".", "..", "a/b", "a\nb", "a\rb", "a\x00b", "a\x7fb", "x" * (mod.MAX_NAME_BYTES + 1),
                 "é" * 200, 123, None, ["a"]):
       self.assertFalse(mod.valid_drive_name(bad), repr(bad))
 
@@ -469,7 +469,13 @@ class LogTests(TempDirCase):
       self.assertFalse(mod.needs_resync(7))
       path.write_text("\x1b[31m2026/09/18 00:00:00 ERROR : Bisync interrupted. Must run --resync to recover.\x1b[0m\n")
       self.assertTrue(mod.needs_resync(7))
-      path.write_text("2026/09/18 00:00:00 NOTICE: Bisync aborted. Error is retryable without --resync due to --resilient mode.\n")
+      # With --resilient the critical error is still rclone's own line; the
+      # "aborted" line after it changes wording (verified with rclone 1.75).
+      path.write_text("2026/09/18 00:00:00 ERROR : Bisync critical error: filters file has changed (must run --resync): /x/filters.txt\n"
+                      "2026/09/18 00:00:00 ERROR : Bisync aborted. Error is retryable without --resync due to --resilient mode.\n")
+      self.assertTrue(mod.needs_resync(7))
+      path.write_text("2026/09/18 00:00:00 INFO  : evil (must run --resync): Copied (new)\n"
+                      "2026/09/18 00:00:00 ERROR : Bisync aborted. Error is retryable without --resync due to --resilient mode.\n")
       self.assertFalse(mod.needs_resync(7))
 
 
@@ -490,6 +496,34 @@ class WalkBudgetTests(TempDirCase):
     sizes, _ = mod.local_top_level(root)
     self.assertNotIn("bad\nname", sizes)
     self.assertEqual(len(sizes), 30)
+    # One folder exhausting its budget never zeroes the ones after it.
+    with mock.patch.object(mod, "MAX_WALK_ENTRIES", 5):
+      sizes, approx = mod.local_top_level(root)
+    self.assertTrue(approx)
+    self.assertEqual(len(sizes), 30)
+    self.assertTrue(all(size > 0 for size in sizes.values()), sizes)
+
+  def test_signal_handler_terms_before_it_kills(self):
+    import signal
+    import subprocess
+    import time
+    script = write_script(self.tmp / "trap", """\
+      #!/bin/sh
+      trap 'echo bye > "$FAKE_OUT"; exit 0' TERM
+      while :; do sleep 0.1; done
+      """)
+    out = self.tmp / "out"
+    proc = subprocess.Popen([script], start_new_session=True, env={**os.environ, "FAKE_OUT": str(out)})
+    mod._LIVE.add(proc)
+    time.sleep(0.3)                      # let the script install its trap first
+    try:
+      started = time.monotonic()
+      mod.kill_live_children(grace=5.0)
+      self.assertLess(time.monotonic() - started, 4)
+      self.assertEqual(out.read_text().strip(), "bye")      # it got TERM and exited on its own
+    finally:
+      mod._LIVE.discard(proc)
+      proc.wait(timeout=5)
 
 
 class StateDirTests(TempDirCase):
