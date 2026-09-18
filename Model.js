@@ -103,14 +103,15 @@ function folderSummary(status) {
   var parts = []
   parts.push(count === 0 ? "No folders" : (count === 1 ? "1 folder" : count + " folders"))
   if (status.rootFiles) parts.push("root files")
-  parts.push(formatBytes(status.localBytes) + " on disk")
+  parts.push((status.localBytesApprox ? "≈ " : "") + formatBytes(status.localBytes) + " on disk")
   return parts.join(" · ")
 }
 
 function folderMeta(folder) {
   if (!folder) return ""
-  if (folder.stale) return "No longer syncing · " + formatBytes(folder.localBytes)
-  if (folder.selected) return folder.onDisk ? formatBytes(folder.localBytes) + " on disk" : "Waiting for first sync"
+  var bytes = (folder.approx ? "≈ " : "") + formatBytes(folder.localBytes)
+  if (folder.stale) return "No longer syncing · " + bytes
+  if (folder.selected) return folder.onDisk ? bytes + " on disk" : "Waiting for first sync"
   return "Not synced"
 }
 

@@ -216,7 +216,8 @@ Panel {
                 ? Model.folderSummary({
                     selectedCount: drive.selectedCount,
                     rootFiles: drive.rootFiles,
-                    localBytes: drive.localBytes
+                    localBytes: drive.localBytes,
+                    localBytesApprox: drive.localBytesApprox
                   })
                 : "Not connected"
               foreground: root.foreground
@@ -254,6 +255,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             visible: text !== ""
             width: parent.width
             text: drive.actionStatus !== "" ? drive.actionStatus
@@ -276,7 +278,7 @@ Panel {
             width: parent.width
             spacing: Style.spacing.labelGap
 
-            InfoPair { label: "On disk"; value: Model.formatBytes(drive.localBytes) }
+            InfoPair { label: "On disk"; value: (drive.localBytesApprox ? "≈ " : "") + Model.formatBytes(drive.localBytes) }
             InfoPair {
               label: "In Drive"
               value: Model.usageText(drive.usedBytes, drive.quotaBytes, drive.quotaKnown)
@@ -354,6 +356,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               visible: drive.foldersLoading && root.folderRows.length === 0
               width: parent.width
               text: "Reading your Drive folders…"
@@ -395,6 +398,7 @@ Panel {
               spacing: Style.space(8)
 
               Text {
+                textFormat: Text.PlainText
                 Layout.fillWidth: true
                 text: Model.formatBytes(drive.staleBytes) + " is still on disk for folders you stopped syncing."
                 color: root.dim
@@ -423,6 +427,7 @@ Panel {
     spacing: Style.space(4)
 
     Text {
+      textFormat: Text.PlainText
       width: parent.width
       text: drive.installed
         ? "Connect the " + drive.remoteName + ": remote"
@@ -433,6 +438,7 @@ Panel {
     }
 
     Text {
+      textFormat: Text.PlainText
       width: parent.width
       text: drive.installed
         ? "Run rclone config to create a Google Drive remote named " + drive.remoteName + ", then refresh."
@@ -472,6 +478,7 @@ Panel {
       spacing: Style.space(8)
 
       Text {
+        textFormat: Text.PlainText
         text: folderRow.checked ? "󰄲" : "󰄱"
         color: folderRow.checked ? root.foreground : root.dim
         font.family: root.fontFamily
@@ -481,6 +488,7 @@ Panel {
       }
 
       Text {
+        textFormat: Text.PlainText
         text: Model.folderGlyph({ selected: folderRow.checked })
         color: folderRow.folder && folderRow.folder.stale ? root.urgent : root.dim
         font.family: root.fontFamily
@@ -495,6 +503,7 @@ Panel {
         spacing: Style.space(1)
 
         Text {
+          textFormat: Text.PlainText
           Layout.fillWidth: true
           text: folderRow.folderName
           color: root.foreground
@@ -504,6 +513,7 @@ Panel {
         }
 
         Text {
+          textFormat: Text.PlainText
           Layout.fillWidth: true
           text: Model.folderMeta(folderRow.folder)
           color: folderRow.folder && folderRow.folder.stale ? root.urgent : root.dim
@@ -538,6 +548,7 @@ Panel {
       spacing: Style.space(8)
 
       Text {
+        textFormat: Text.PlainText
         text: drive.rootFiles ? "󰄲" : "󰄱"
         color: drive.rootFiles ? root.foreground : root.dim
         font.family: root.fontFamily
@@ -547,6 +558,7 @@ Panel {
       }
 
       Text {
+        textFormat: Text.PlainText
         text: "󰈔"
         color: root.dim
         font.family: root.fontFamily
@@ -561,6 +573,7 @@ Panel {
         spacing: Style.space(1)
 
         Text {
+          textFormat: Text.PlainText
           Layout.fillWidth: true
           text: "Loose files at the top of Drive"
           color: root.foreground
@@ -570,6 +583,7 @@ Panel {
         }
 
         Text {
+          textFormat: Text.PlainText
           Layout.fillWidth: true
           text: Model.rootFilesMeta(drive.rootFileCount, drive.rootFileBytes)
           color: root.dim
@@ -597,6 +611,7 @@ Panel {
   }
 
   component InfoLabel: Text {
+    textFormat: Text.PlainText
     color: root.foreground
     opacity: 0.6
     font.family: root.fontFamily
@@ -604,6 +619,7 @@ Panel {
   }
 
   component InfoValue: Text {
+    textFormat: Text.PlainText
     color: root.foreground
     font.family: root.fontFamily
     font.pixelSize: Style.font.bodySmall
