@@ -29,6 +29,14 @@ Security hardening after the second marketplace review.
   `<img src=…>` no longer fetches anything); the on-disk size walk has an
   entry and time budget and is shown as `≈` when cut short; `rclone about`
   is asked at most once a minute.
+- Names may start or end with whitespace (Drive allows it and the filter
+  rule carries it); only control characters, `/`, `.` and `..` are refused.
+  Each top-level folder gets its own walk budget under one clock, and the
+  panel keys the "still on disk" notice on a folder count as well as bytes,
+  so one huge folder cannot hide another. A SIGTERM to the helper forwards
+  SIGTERM to rclone and waits before killing, so a `systemctl stop` lets
+  bisync drop its lock. Resync detection recognises rclone's critical-error
+  line with and without `--resilient`.
 - Unit files escape `%` and `$`; paths with control characters are
   refused. The mount point and the sync root must be real directories of
   yours (a symlinked sync root is refused); the browse mount caps its VFS

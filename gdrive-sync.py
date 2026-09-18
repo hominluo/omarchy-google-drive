@@ -254,8 +254,20 @@ def run(command: list[str], timeout: float = 20, pass_fds: tuple[int, ...] = (),
   return code, bytes(out).decode("utf-8", "replace").strip(), err
 
 
-def kill_live_children() -> None:
-  for proc in list(_LIVE):
+def kill_live_children(grace: float = 10.0) -> None:
+  """Stop every child this helper started: SIGTERM to each process group
+  (rclone finishes its listings and drops its lock on TERM), a short wait,
+  then SIGKILL for whatever is still there."""
+  procs = list(_LIVE)
+  for proc in procs:
+    try:
+      os.killpg(proc.pid, signal.SIGTERM)
+    except OSError:
+      pass
+  deadline = time.monotonic() + grace
+  while time.monotonic() < deadline and any(proc.poll() is None for proc in procs):
+    time.sleep(0.05)
+  for proc in procs:
     try:
       os.killpg(proc.pid, signal.SIGKILL)
     except OSError:
@@ -334,7 +346,7 @@ def iter_json_array(chunks: Iterable[bytes], *, max_entries: int | None = None,
 def valid_drive_name(name: object) -> bool:
   """A Drive folder name the widget will list, select and write into a
   filter rule. Anything else is left out entirely."""
-  if not isinstance(name, str) or not name or name in (".", "..") or name != name.strip():
+  if not isinstance(name, str) or not name.strip() or name in (".", ".."):
     return False
   if NAME_BAD.search(name):
     return False
@@ -611,16 +623,22 @@ def filters_hash() -> str:
     return ""
 
 
+# rclone's own diagnostics for "needs a baseline", at the start of a log
+# line: the critical error itself (printed with and without --resilient,
+# which only changes the "aborted" line that follows), and the abort lines.
 RESYNC_LINE = re.compile(
-  r"^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)? ERROR : Bisync (?:aborted|interrupted)\. Must run --resync to recover\.\s*$",
+  r"^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)? ERROR : Bisync (?:"
+  r"critical error: (?:filters file has changed|cannot find prior Path1 or Path2 listings)[^\n]{0,40}\(must run --resync\)"
+  r"|(?:aborted|interrupted)\. Must run --resync to recover\.\s*$)",
   re.M)
 
 
 def needs_resync(code: int) -> bool:
   """bisync reports a stale filters file only in --log-file, never on stderr,
-  so the exit code is the signal and rclone's own timestamped ERROR line in
-  the log tail confirms it. A remote file name that happens to contain the
-  words sits on an INFO line and never matches."""
+  so the exit code is the signal (7, a FatalError, verified with rclone
+  1.75 both with and without --resilient) and rclone's own timestamped
+  ERROR line in the log tail confirms it. A remote file name that happens
+  to contain the words sits on an INFO line and never matches."""
   if code not in RCLONE_RESYNC_CODES:
     return False
   return RESYNC_LINE.search(ANSI.sub("", tail_bytes(LOG_PATH, LOG_TAIL_BYTES))) is not None
@@ -902,10 +920,13 @@ def directory_bytes(path: Path, budget: WalkBudget | None = None) -> tuple[int, 
 
 
 def local_top_level(folder: Path) -> tuple[dict[str, int], bool]:
-  """Bytes on disk per top-level entry of the synced folder, under one
-  budget for the whole tree; (sizes, approximate)."""
+  """Bytes on disk per top-level entry of the synced folder; (sizes,
+  approximate). Each folder gets its own entry budget under one shared
+  clock, so one huge folder cannot zero out the ones walked after it: a
+  folder that is on disk is always listed, at worst with a cut-short size."""
   sizes: dict[str, int] = {}
-  budget = WalkBudget()
+  approx = False
+  deadline = time.monotonic() + MAX_WALK_SECONDS
   try:
     entries = list(os.scandir(folder))
   except OSError:
@@ -915,10 +936,12 @@ def local_top_level(folder: Path) -> tuple[dict[str, int], bool]:
       continue
     try:
       if entry.is_dir(follow_symlinks=False):
-        sizes[entry.name], _ = directory_bytes(Path(entry.path), budget)
+        budget = WalkBudget(max_entries=MAX_WALK_ENTRIES, max_seconds=max(0.05, deadline - time.monotonic()))
+        sizes[entry.name], cut = directory_bytes(Path(entry.path), budget)
+        approx = approx or cut
     except OSError:
       continue
-  return sizes, budget.exhausted
+  return sizes, approx
 
 
 # ---------------------------------------------------------------- mount side
@@ -1218,6 +1241,7 @@ def folders_payload(remote_value: str, folder_value: str) -> dict[str, Any]:
     "rootFileBytes": root_bytes,
     "staleBytes": sum(row["localBytes"] for row in rows if not row["selected"] and row["onDisk"])
       + sum(row["localBytes"] for row in stale),
+    "staleCount": sum(1 for row in rows if not row["selected"] and row["onDisk"]) + len(stale),
     "localBytesApprox": approx,
     "lastError": "",
   }
