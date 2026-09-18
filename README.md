@@ -216,6 +216,20 @@ logged out: `sudo loginctl enable-linger "$USER"`.
 - The interpreter baked into those units is `/usr/bin/python3` on purpose: a
   systemd user unit doesn't inherit the PATH that mise, pyenv or asdf put their
   shims on, and those paths move on every version bump.
+- **Trust boundary.** A two-way sync means anyone who can edit a Drive folder
+  you selected edits the copy on your disk: their changes and deletions arrive
+  on the next run (bisync's default `--max-delete 50` aborts a run that would
+  delete more than half of one side, after which the panel asks for a look).
+  There is no size limit on what a selected folder may hold, so keep a share
+  you do not trust in the browse mount rather than the sync selection.
+  Everything the remote sends is treated as untrusted: folder listings are
+  streamed from rclone under hard caps (5000 top-level folders, 8 MiB of
+  listing, 255-byte names) and refused whole past a cap, names that could not
+  be safe on disk or in a filter rule are left out, rclone's output is read
+  under a byte limit and its process group is killed on a deadline, and the
+  panel renders every string as plain text. The state directory and its files
+  are private (0700/0600), `sync.log` rolls over at 2 MiB, and the on-disk
+  size shown in the panel is marked `≈` when the walk was cut short.
 - The marketplace security baseline reports four capabilities for this plugin,
   and it is worth being precise about which are the plugin's. Three of them —
   package management, privilege, and remote build — are detected from commands
@@ -235,7 +249,7 @@ systemctl --user list-timers omarchy-gdrive-sync.timer
 systemctl --user status omarchy-gdrive-sync.service omarchy-gdrive-browse.service
 journalctl --user -u omarchy-gdrive-sync.service -n 50
 
-tail -40 ~/.local/state/omarchy-gdrive/sync.log   # rclone's own log
+tail -40 ~/.local/state/omarchy-gdrive/sync.log   # rclone's own log (rolls to sync.log.1 at 2 MiB)
 cat ~/.local/state/omarchy-gdrive/filters.txt     # your selection, compiled
 jq . ~/.local/state/omarchy-gdrive/state.json     # last run result
 ```

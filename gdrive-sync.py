@@ -14,26 +14,33 @@ Quickshell widget. It never reads or writes rclone's credentials.
 from __future__ import annotations
 
 import argparse
+import codecs
+import ctypes
 import errno
 import fcntl
 import hashlib
+import itertools
 import json
 import os
 import re
 import secrets
+import selectors
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Iterator
 
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state")) / "omarchy-gdrive"
 SELECTION_PATH = STATE_DIR / "selection.json"
 FILTERS_PATH = STATE_DIR / "filters.txt"
 STATE_PATH = STATE_DIR / "state.json"
+CACHE_PATH = STATE_DIR / "cache.json"
 LOG_PATH = STATE_DIR / "sync.log"
+MOUNT_LOG_PATH = STATE_DIR / "mount.log"
 WORKDIR = STATE_DIR / "workdir"
 LOCK_PATH = STATE_DIR / "sync.lock"
 UNIT_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")) / "systemd" / "user"
@@ -45,6 +52,30 @@ TIMER = "omarchy-gdrive-sync.timer"
 REMOTE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]*$")
 GLOB_SPECIALS = set("\\*?[]{}")
 SKIP_LOCAL = {".rclone-bisync", "lost+found"}
+CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+# A Drive name lands in a filter rule, an argv and the panel; a byte that is
+# not fit for all three (a newline, a slash, a control) keeps it out of all.
+NAME_BAD = re.compile(r"[\x00-\x1f\x7f/]")
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+# Everything a child process or the remote sends is read under a cap. A
+# listing that blows one is refused whole rather than shown in part.
+MAX_OUTPUT = 1 << 20            # default per-pipe cap for run()
+MAX_LIST_BYTES = 8 << 20        # rclone lsjson transfer cap
+MAX_LIST_ENTRIES = 5000         # top-level folders the widget will show
+MAX_ITEM_BYTES = 64 << 10       # one lsjson row
+MAX_NAME_BYTES = 255            # NAME_MAX: rclone could not create a longer local name anyway
+CHECK_STDERR_BYTES = 256 << 10  # rclone check prints one line per differing file
+LOG_ROTATE_BYTES = 2 << 20
+LOG_TAIL_BYTES = 16384
+MAX_WALK_ENTRIES = 100_000
+MAX_WALK_SECONDS = 2.0
+ABOUT_CACHE_SECONDS = 60
+EXIT_TIMEOUT = 124
+EXIT_TOO_LARGE = 125
+# bisync's "must run --resync" abort is a FatalError (exit 7 in current
+# rclone; the docs say 2), never a plain error.
+RCLONE_RESYNC_CODES = (2, 7)
 
 
 # ---------------------------------------------------------------- primitives
@@ -54,16 +85,312 @@ def clean_text(value: str, limit: int = 400) -> str:
   return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def run(command: list[str], timeout: float = 20, pass_fds: tuple[int, ...] = ()) -> tuple[int, str, str]:
+try:
+  _PRCTL = ctypes.CDLL(None, use_errno=True).prctl
+  _PRCTL.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+except (OSError, AttributeError):
+  _PRCTL = None
+
+
+def _die_with_parent() -> None:
+  """Runs in the child between fork and exec: PR_SET_PDEATHSIG, so an rclone
+  outlives neither this helper nor the watchdog that kills it. The helper is
+  single-threaded and the symbol was resolved in the parent, which is what
+  makes a preexec_fn safe here."""
+  if _PRCTL is not None:
+    _PRCTL(1, int(signal.SIGKILL), 0, 0, 0)
+
+
+class ChildTimeout(RuntimeError):
+  code = EXIT_TIMEOUT
+
+
+class ChildOutputTooLarge(RuntimeError):
+  code = EXIT_TOO_LARGE
+
+
+_LIVE: set[subprocess.Popen] = set()
+
+
+class Child:
+  """A child process read under a deadline and per-pipe byte caps, in its
+  own session so the whole group can be killed. Yields stdout as it comes;
+  stderr is collected. Hitting any limit kills the group and raises, and
+  the caller gets nothing rather than a partial result."""
+
+  def __init__(self, command: list[str], *, timeout: float = 20.0, max_stdout: int = MAX_OUTPUT,
+               max_stderr: int = MAX_OUTPUT, pass_fds: tuple[int, ...] = ()):
+    self.command = command
+    self.timeout = timeout
+    self.max_stdout = max_stdout
+    self.max_stderr = max_stderr
+    self.pass_fds = pass_fds
+    self.proc: subprocess.Popen | None = None
+    self.stderr = bytearray()
+    self.returncode: int | None = None
+    self.deadline = 0.0
+
+  def __enter__(self) -> "Child":
+    self.proc = subprocess.Popen(
+      self.command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+      start_new_session=True, pass_fds=self.pass_fds, preexec_fn=_die_with_parent)
+    self.deadline = time.monotonic() + self.timeout
+    _LIVE.add(self.proc)
+    return self
+
+  def __exit__(self, *exc: object) -> None:
+    proc = self.proc
+    if proc is None:
+      return
+    self._killpg()
+    if proc.poll() is None:
+      try:
+        proc.wait(timeout=5)
+      except subprocess.TimeoutExpired:
+        pass
+    for pipe in (proc.stdout, proc.stderr):
+      if pipe is not None:
+        pipe.close()
+    _LIVE.discard(proc)
+
+  def _killpg(self) -> None:
+    proc = self.proc
+    if proc is None:
+      return
+    try:
+      os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+      pass  # already gone, or not ours to signal
+
+  def _abort(self) -> None:
+    self._killpg()
+    if self.proc is not None:
+      try:
+        self.proc.wait(timeout=5)
+      except subprocess.TimeoutExpired:
+        pass
+
+  def chunks(self) -> Iterator[bytes]:
+    proc = self.proc
+    assert proc is not None and proc.stdout is not None and proc.stderr is not None
+    out_fd, err_fd = proc.stdout.fileno(), proc.stderr.fileno()
+    limit = {out_fd: self.max_stdout, err_fd: self.max_stderr}
+    seen = {out_fd: 0, err_fd: 0}
+    with selectors.DefaultSelector() as sel:
+      for fd in limit:
+        sel.register(fd, selectors.EVENT_READ)
+      while limit:
+        wait = self.deadline - time.monotonic()
+        if wait <= 0:
+          self._abort()
+          raise ChildTimeout()
+        for key, _ in sel.select(wait):
+          try:
+            data = os.read(key.fd, 65536)
+          except OSError:
+            data = b""
+          if not data:
+            sel.unregister(key.fd)
+            del limit[key.fd]
+            continue
+          seen[key.fd] += len(data)
+          if seen[key.fd] > limit[key.fd]:
+            self._abort()
+            raise ChildOutputTooLarge()
+          if key.fd == err_fd:
+            self.stderr += data
+          else:
+            yield data
+    try:
+      self.returncode = proc.wait(timeout=max(0.0, self.deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+      self._abort()
+      raise ChildTimeout()
+    # The leader has exited with its own code; anything it left behind in
+    # the session goes now.
+    self._killpg()
+
+  def stderr_text(self) -> str:
+    return bytes(self.stderr).decode("utf-8", "replace").strip()
+
+  def failure(self) -> str:
+    """After a read was abandoned: the child's own complaint if it exited
+    on its own with an error, else "". Stops the child first."""
+    proc = self.proc
+    if proc is None:
+      return ""
+    self._abort()
+    room = max(0, self.max_stderr - len(self.stderr))
+    if proc.stderr is not None and room:
+      try:
+        self.stderr += os.read(proc.stderr.fileno(), room)
+      except OSError:
+        pass
+    code = proc.returncode
+    if code is None or code == 0 or code < 0:
+      return ""
+    return self.stderr_text()
+
+
+def run(command: list[str], timeout: float = 20, pass_fds: tuple[int, ...] = (), *,
+        max_stdout: int = MAX_OUTPUT, max_stderr: int = MAX_OUTPUT) -> tuple[int, str, str]:
+  """(code, stdout, stderr). A child that overruns the deadline or a cap is
+  killed with its group and reported as 124 / 125 with empty output."""
+  out = bytearray()
   try:
-    done = subprocess.run(command, check=False, capture_output=True, text=True, timeout=timeout, pass_fds=pass_fds)
+    with Child(command, timeout=timeout, max_stdout=max_stdout, max_stderr=max_stderr, pass_fds=pass_fds) as child:
+      for data in child.chunks():
+        out += data
+      code = child.returncode or 0
+      err = child.stderr_text()
   except FileNotFoundError as error:
     return 127, "", str(error)
-  except subprocess.TimeoutExpired as error:
-    out = error.stdout if isinstance(error.stdout, str) else (error.stdout or b"").decode(errors="replace")
-    err = error.stderr if isinstance(error.stderr, str) else (error.stderr or b"").decode(errors="replace")
-    return 124, out or "", err or "Command timed out"
-  return done.returncode, done.stdout.strip(), done.stderr.strip()
+  except OSError as error:
+    return 126, "", str(error)
+  except ChildTimeout:
+    return EXIT_TIMEOUT, "", f"Command timed out after {timeout:g}s"
+  except ChildOutputTooLarge:
+    return EXIT_TOO_LARGE, "", "Command produced too much output"
+  return code, bytes(out).decode("utf-8", "replace").strip(), err
+
+
+def kill_live_children() -> None:
+  for proc in list(_LIVE):
+    try:
+      os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+      pass
+
+
+def _on_signal(signum: int, _frame: object) -> None:
+  kill_live_children()
+  raise SystemExit(128 + signum)
+
+
+class ListingTooLarge(RuntimeError):
+  pass
+
+
+class ListingUnreadable(RuntimeError):
+  pass
+
+
+def iter_json_array(chunks: Iterable[bytes], *, max_entries: int | None = None,
+                    max_item_bytes: int | None = None) -> Iterator[Any]:
+  """Stream the objects of a JSON array (rclone lsjson's output) one at a
+  time, holding at most one item's bytes in memory. Every row must be an
+  object; the count and the size of a row are capped."""
+  max_entries = MAX_LIST_ENTRIES if max_entries is None else max_entries
+  max_item = MAX_ITEM_BYTES if max_item_bytes is None else max_item_bytes
+  decoder = json.JSONDecoder(parse_constant=lambda _: None)      # Infinity / NaN -> None
+  utf8 = codecs.getincrementaldecoder("utf-8")(errors="replace")
+  buf = ""
+  opened = False
+  closed = False
+  count = 0
+  for raw in itertools.chain(chunks, (b"",)):
+    buf += utf8.decode(raw, final=not raw)
+    while True:
+      buf = buf.lstrip()
+      if not buf:
+        break
+      if closed:
+        raise ListingUnreadable("data after the end of the listing")
+      if not opened:
+        if buf[0] != "[":
+          raise ListingUnreadable("listing does not start with an array")
+        buf = buf[1:]
+        opened = True
+        continue
+      if buf[0] == "]":
+        # Keep draining: the producer must reach EOF so its exit code is known.
+        closed = True
+        buf = buf[1:]
+        continue
+      if buf[0] == ",":
+        buf = buf[1:]
+        continue
+      if buf[0] != "{":
+        raise ListingUnreadable("listing row is not an object")
+      try:
+        item, end = decoder.raw_decode(buf)
+      except json.JSONDecodeError:
+        if len(buf) > max_item:
+          raise ListingTooLarge("a listing entry is too long")
+        break                                                    # need more bytes
+      except ValueError:
+        raise ListingUnreadable("listing row is not readable")    # e.g. an absurdly long number
+      if end > max_item:
+        raise ListingTooLarge("a listing entry is too long")
+      buf = buf[end:]
+      count += 1
+      if count > max_entries:
+        raise ListingTooLarge(f"more than {max_entries} entries")
+      yield item
+  if not closed:
+    raise ListingUnreadable("listing ended early")
+
+
+def valid_drive_name(name: object) -> bool:
+  """A Drive folder name the widget will list, select and write into a
+  filter rule. Anything else is left out entirely."""
+  if not isinstance(name, str) or not name or name in (".", "..") or name != name.strip():
+    return False
+  if NAME_BAD.search(name):
+    return False
+  try:
+    return len(name.encode("utf-8")) <= MAX_NAME_BYTES
+  except UnicodeEncodeError:
+    return False
+
+
+def clamp_int(value: object, limit: int = 1 << 62) -> int:
+  """A non-negative integer from JSON, else 0 (bool, float, str all count as 0)."""
+  if isinstance(value, bool) or not isinstance(value, int):
+    return 0
+  return value if 0 <= value <= limit else 0
+
+
+def tail_bytes(path: Path, limit: int) -> str:
+  """The last `limit` bytes of a regular file, without reading the rest."""
+  try:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+  except OSError:
+    return ""
+  try:
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode):
+      return ""
+    os.lseek(fd, max(0, info.st_size - limit), os.SEEK_SET)
+    chunks = []
+    remaining = limit
+    while remaining > 0:
+      data = os.read(fd, min(65536, remaining))
+      if not data:
+        break
+      chunks.append(data)
+      remaining -= len(data)
+    return b"".join(chunks).decode("utf-8", "replace")
+  finally:
+    os.close(fd)
+
+
+def rotate_log(path: Path, limit: int = LOG_ROTATE_BYTES) -> None:
+  """Roll `path` to `path.1` once it exceeds `limit`, discarding the older
+  roll. Only called while nothing is writing the log."""
+  dfd = open_owned_dir(path.parent, fix_mode=0o700)
+  try:
+    try:
+      info = os.stat(path.name, dir_fd=dfd, follow_symlinks=False)
+    except FileNotFoundError:
+      return
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+      _unlink_quiet(path.name, dfd)
+      return
+    if info.st_size > limit:
+      os.replace(path.name, path.name + ".1", src_dir_fd=dfd, dst_dir_fd=dfd)
+  finally:
+    os.close(dfd)
 
 
 def rclone_bin() -> str | None:
@@ -78,12 +405,16 @@ def normalize_remote(value: str) -> str:
 
 
 def normalize_path(value: str, fallback: str) -> Path:
+  if CONTROL.search(value or ""):
+    raise ValueError("Folder path contains control characters")
   path = Path(os.path.expandvars(os.path.expanduser(value or fallback)))
   path = path if path.is_absolute() else (Path.home() / path)
   resolved = Path(os.path.normpath(str(path)))
   home = Path.home().resolve()
   if resolved in (Path("/"), home) or home not in resolved.parents:
     raise ValueError("Choose a folder inside your home directory, not the home directory itself")
+  if CONTROL.search(str(resolved)):
+    raise ValueError("Folder path contains control characters")
   return resolved
 
 
@@ -95,10 +426,11 @@ def read_json(path: Path, fallback: Any) -> Any:
     return fallback
 
 
-def open_owned_dir(path: Path) -> int:
+def open_owned_dir(path: Path, *, fix_mode: int | None = None) -> int:
   """Open a directory we own, refusing a symlink standing in its place.
   Every write below happens relative to a descriptor from here, so another
-  process racing the pathname cannot redirect it."""
+  process racing the pathname cannot redirect it. With `fix_mode`, a
+  directory that lets group or others in is tightened on the descriptor."""
   path.mkdir(parents=True, exist_ok=True, mode=0o700)
   try:
     fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
@@ -110,7 +442,38 @@ def open_owned_dir(path: Path) -> int:
   if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
     os.close(fd)
     raise RuntimeError(f"{path} is not a directory owned by you; refusing to write there")
+  if fix_mode is not None and stat.S_IMODE(info.st_mode) & 0o077:
+    try:
+      os.fchmod(fd, fix_mode)
+    except OSError:
+      pass
   return fd
+
+
+def ensure_state_dir() -> None:
+  """The state directory and everything in it are private to this user.
+  Files an older release created 0644 (and rclone's own listings, which it
+  writes with the umask on every run) are tightened each time."""
+  for directory in (STATE_DIR, WORKDIR):
+    dfd = open_owned_dir(directory, fix_mode=0o700)
+    try:
+      with os.scandir(dfd) as scan:
+        names = [entry.name for entry in scan if entry.is_file(follow_symlinks=False)]
+      for name in names:
+        try:
+          fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dfd)
+        except OSError:
+          continue
+        try:
+          info = os.fstat(fd)
+          if stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) & 0o077:
+            os.fchmod(fd, 0o600)
+        except OSError:
+          pass
+        finally:
+          os.close(fd)
+    finally:
+      os.close(dfd)
 
 
 def write_atomic(path: Path, text: str, mode: int = 0o600) -> None:
@@ -207,10 +570,12 @@ def load_selection() -> dict[str, Any]:
   data = read_json(SELECTION_PATH, {})
   if not isinstance(data, dict):
     data = {}
-  folders = data.get("folders")
-  folders = [str(name) for name in folders if str(name).strip()] if isinstance(folders, list) else []
+  folders = data.get("folders") if isinstance(data.get("folders"), list) else []
+  kept = [name for name in folders if valid_drive_name(name)]
+  if len(kept) != len(folders):
+    print(f"ignoring {len(folders) - len(kept)} invalid folder name(s) in selection.json", file=sys.stderr)
   return {
-    "folders": sorted(dict.fromkeys(folders), key=str.casefold),
+    "folders": sorted(dict.fromkeys(kept), key=str.casefold)[:MAX_LIST_ENTRIES],
     "rootFiles": data.get("rootFiles", True) is not False,
   }
 
@@ -230,6 +595,8 @@ def build_filters(selection: dict[str, Any]) -> str:
     "# panel instead; this file is rewritten on every change.",
   ]
   for name in selection["folders"]:
+    if not valid_drive_name(name):
+      continue  # never a rule from a name that could hold one
     lines.append("+ /" + escape_glob(name) + "/**")
   if selection["rootFiles"]:
     lines.append("+ /*")
@@ -244,15 +611,19 @@ def filters_hash() -> str:
     return ""
 
 
-def needs_resync(message: str) -> bool:
-  """bisync reports a stale filters file only in --log-file, never on stderr."""
-  if "must run --resync" in message.lower():
-    return True
-  try:
-    tail = LOG_PATH.read_text(encoding="utf-8", errors="replace")[-8000:]
-  except OSError:
+RESYNC_LINE = re.compile(
+  r"^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)? ERROR : Bisync (?:aborted|interrupted)\. Must run --resync to recover\.\s*$",
+  re.M)
+
+
+def needs_resync(code: int) -> bool:
+  """bisync reports a stale filters file only in --log-file, never on stderr,
+  so the exit code is the signal and rclone's own timestamped ERROR line in
+  the log tail confirms it. A remote file name that happens to contain the
+  words sits on an INFO line and never matches."""
+  if code not in RCLONE_RESYNC_CODES:
     return False
-  return "must run --resync" in tail.lower()
+  return RESYNC_LINE.search(ANSI.sub("", tail_bytes(LOG_PATH, LOG_TAIL_BYTES))) is not None
 
 
 def sync_filters_file(selection: dict[str, Any]) -> bool:
@@ -288,8 +659,13 @@ def service_active() -> bool:
 
 
 def systemd_quote(value: str) -> str:
-  """Quote a value for a systemd Exec= line; paths here contain spaces."""
-  return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+  """Quote a value for a systemd Exec= line; paths here contain spaces.
+  `%` is a specifier and `$` an expansion to systemd, so both are doubled;
+  a control character would end the line, so it is refused."""
+  if CONTROL.search(value):
+    raise ValueError("Path contains control characters")
+  escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%").replace("$", "$$")
+  return '"' + escaped + '"'
 
 
 def unit_sources(remote: str, folder: Path, mount: Path) -> dict[str, str]:
@@ -386,90 +762,163 @@ def configured_remotes(rclone: str) -> tuple[set[str], str]:
 
 
 def remote_folders(rclone: str, remote: str) -> tuple[list[str], str]:
-  code, out, err = run([rclone, "lsjson", f"{remote}:", "--dirs-only", "--no-modtime"], timeout=90)
-  if code != 0:
-    return [], clean_text(err or out or "Could not list Google Drive folders")
+  """The Drive's top-level folders, streamed from rclone under hard caps.
+  Anyone can share a folder into a Drive, so the count, the size of the
+  listing and every name are bounded; past a bound there is no listing at
+  all, never a partial one."""
+  names: list[str] = []
+  dropped = 0
   try:
-    rows = json.loads(out or "[]")
-  except json.JSONDecodeError:
-    return [], "rclone returned an unreadable folder listing"
-  names = [str(row.get("Name") or "") for row in rows if isinstance(row, dict)]
-  return sorted((n for n in names if n), key=str.casefold), ""
+    with Child([rclone, "lsjson", f"{remote}:", "--dirs-only", "--no-modtime"],
+               timeout=90, max_stdout=MAX_LIST_BYTES) as child:
+      try:
+        for row in iter_json_array(child.chunks()):
+          name = row.get("Name") if isinstance(row, dict) else None
+          if valid_drive_name(name):
+            names.append(name)
+          else:
+            dropped += 1
+      except ListingUnreadable:
+        # rclone that failed outright prints nothing on stdout: say why.
+        return [], clean_text(child.failure() or "rclone returned an unreadable folder listing")
+      if child.returncode != 0:
+        return [], clean_text(child.stderr_text() or "Could not list Google Drive folders")
+  except ListingTooLarge:
+    return [], f"Google Drive has more than {MAX_LIST_ENTRIES} top-level folders (or an unusable entry); the widget can't list it"
+  except ChildTimeout:
+    return [], "Listing Google Drive folders timed out"
+  except ChildOutputTooLarge:
+    return [], "The Google Drive folder listing is too large to show"
+  except OSError as error:
+    return [], clean_text(str(error))
+  if dropped:
+    print(f"left out {dropped} Drive folder(s) whose names are not usable here", file=sys.stderr)
+  return sorted(names, key=str.casefold), ""
 
 
 def remote_root_files(rclone: str, remote: str) -> tuple[int, int, str]:
-  """Loose files at the top of the Drive — the ones in no folder at all."""
-  code, out, err = run([rclone, "lsjson", f"{remote}:", "--files-only", "--no-modtime"], timeout=90)
+  """Loose files at the top of the Drive — the ones in no folder at all.
+  `rclone size` with the same two rules the sync uses answers with one
+  small object however many files there are."""
+  code, out, err = run([rclone, "size", f"{remote}:", "--json", "--filter", "+ /*", "--filter", "- **"],
+                       timeout=90, max_stdout=65536)
   if code != 0:
-    return 0, 0, clean_text(err or out or "Could not list Google Drive files")
+    return 0, 0, clean_text(err or out or "Could not count Google Drive files")
   try:
-    rows = json.loads(out or "[]")
-  except json.JSONDecodeError:
-    return 0, 0, "rclone returned an unreadable file listing"
-  count = 0
-  total = 0
-  for row in rows:
-    if not isinstance(row, dict):
-      continue
-    count += 1
-    size = row.get("Size")
-    # Google-native docs report -1; they are skipped by the sync anyway.
-    if isinstance(size, (int, float)) and size > 0:
-      total += int(size)
-  return count, total, ""
+    data = json.loads(out or "{}", parse_constant=lambda _: None)
+  except ValueError:
+    return 0, 0, "rclone returned an unreadable file count"
+  if not isinstance(data, dict):
+    return 0, 0, "rclone returned an unreadable file count"
+  return clamp_int(data.get("count")), clamp_int(data.get("bytes")), ""
 
 
-def storage_usage(rclone: str, remote: str) -> tuple[int, int, bool, str]:
-  code, out, err = run([rclone, "about", f"{remote}:", "--json"], timeout=25)
+def load_cache() -> dict[str, Any]:
+  data = read_json(CACHE_PATH, {})
+  return data if isinstance(data, dict) else {}
+
+
+def save_cache(cache: dict[str, Any]) -> None:
+  if cache != load_cache():
+    write_json(CACHE_PATH, cache)
+
+
+def storage_usage(rclone: str, remote: str, cache: dict[str, Any] | None = None) -> tuple[int, int, bool, str]:
+  """(used, total, known, warning). Cached for a minute: the panel polls
+  every few seconds while a sync runs, and that is not a reason to ask
+  Google as often."""
+  entry = (cache or {}).get("about")
+  if isinstance(entry, dict) and entry.get("remote") == remote and time.time() - clamp_int(entry.get("ts")) < ABOUT_CACHE_SECONDS:
+    return (clamp_int(entry.get("used")), clamp_int(entry.get("total")),
+            entry.get("known") is True, str(entry.get("warning") or ""))
+  code, out, err = run([rclone, "about", f"{remote}:", "--json"], timeout=25, max_stdout=65536)
+  used = total = 0
+  warning = ""
   if code != 0:
-    return 0, 0, False, clean_text(err or out or "Storage usage is unavailable")
-  try:
-    data = json.loads(out)
-  except json.JSONDecodeError:
-    return 0, 0, False, "rclone returned invalid storage information"
-  total = max(0, int(data.get("total") or 0))
-  used = data.get("used")
-  if used is None and total > 0 and data.get("free") is not None:
-    used = total - int(data.get("free") or 0)
-  return max(0, int(used or 0)), total, total > 0, ""
+    warning = clean_text(err or out or "Storage usage is unavailable")
+  else:
+    try:
+      data = json.loads(out or "{}", parse_constant=lambda _: None)
+    except ValueError:
+      data = None
+    if not isinstance(data, dict):
+      warning = "rclone returned invalid storage information"
+    else:
+      total = clamp_int(data.get("total"))
+      used_value = data.get("used")
+      if used_value is None and total > 0 and data.get("free") is not None:
+        used_value = total - clamp_int(data.get("free"))
+      used = clamp_int(used_value)
+  known = total > 0
+  if cache is not None:
+    cache["about"] = {"remote": remote, "used": used, "total": total, "known": known, "warning": warning, "ts": int(time.time())}
+  return used, total, known, warning
 
 
-def directory_bytes(path: Path) -> int:
+class WalkBudget:
+  """How much of a local tree a status refresh may walk. Someone with edit
+  rights on a synced shared folder decides how many files it holds; the
+  panel's timer must not."""
+
+  def __init__(self, max_entries: int | None = None, max_seconds: float | None = None):
+    self.remaining = MAX_WALK_ENTRIES if max_entries is None else max_entries
+    self.deadline = time.monotonic() + (MAX_WALK_SECONDS if max_seconds is None else max_seconds)
+    self.exhausted = False
+
+  def spend(self) -> bool:
+    if self.exhausted:
+      return False
+    self.remaining -= 1
+    if self.remaining < 0 or time.monotonic() > self.deadline:
+      self.exhausted = True
+      return False
+    return True
+
+
+def directory_bytes(path: Path, budget: WalkBudget | None = None) -> tuple[int, bool]:
+  """(bytes, approximate): the bytes under `path`, and whether the walk was
+  cut short by the budget."""
+  budget = budget or WalkBudget()
   total = 0
   stack = [path]
-  while stack:
+  while stack and not budget.exhausted:
     current = stack.pop()
     try:
-      entries = list(os.scandir(current))
+      scan = os.scandir(current)
     except OSError:
       continue
-    for entry in entries:
-      try:
-        if entry.is_dir(follow_symlinks=False):
-          stack.append(Path(entry.path))
-        elif entry.is_file(follow_symlinks=False):
-          total += entry.stat(follow_symlinks=False).st_size
-      except OSError:
-        continue
-  return total
+    with scan:
+      for entry in scan:
+        if not budget.spend():
+          break
+        try:
+          if entry.is_dir(follow_symlinks=False):
+            stack.append(Path(entry.path))
+          elif entry.is_file(follow_symlinks=False):
+            total += entry.stat(follow_symlinks=False).st_size
+        except OSError:
+          continue
+  return total, budget.exhausted
 
 
-def local_top_level(folder: Path) -> dict[str, int]:
-  """Bytes on disk per top-level entry of the synced folder."""
+def local_top_level(folder: Path) -> tuple[dict[str, int], bool]:
+  """Bytes on disk per top-level entry of the synced folder, under one
+  budget for the whole tree; (sizes, approximate)."""
   sizes: dict[str, int] = {}
+  budget = WalkBudget()
   try:
     entries = list(os.scandir(folder))
   except OSError:
-    return sizes
+    return sizes, False
   for entry in entries:
-    if entry.name in SKIP_LOCAL:
+    if entry.name in SKIP_LOCAL or not valid_drive_name(entry.name):
       continue
     try:
       if entry.is_dir(follow_symlinks=False):
-        sizes[entry.name] = directory_bytes(Path(entry.path))
+        sizes[entry.name], _ = directory_bytes(Path(entry.path), budget)
     except OSError:
       continue
-  return sizes
+  return sizes, budget.exhausted
 
 
 # ---------------------------------------------------------------- mount side
@@ -524,21 +973,27 @@ def mount_browse(remote: str, mount_path: Path) -> None:
     mounted, by_rclone, fs_type, alive = mount_info(mount_path)
   if mounted and not by_rclone:
     raise RuntimeError(f"{mount_path} is already mounted as {fs_type}")
-  mount_path.mkdir(parents=True, exist_ok=True)
-  if any(mount_path.iterdir()):
-    raise RuntimeError(f"Browse folder is not empty: {mount_path}")
+  # A real directory of ours, not a link to somewhere else, and empty.
+  mount_fd = open_owned_dir(mount_path)
+  try:
+    with os.scandir(mount_fd) as scan:
+      if any(True for _ in scan):
+        raise RuntimeError(f"Browse folder is not empty: {mount_path}")
+  finally:
+    os.close(mount_fd)
 
-  STATE_DIR.mkdir(parents=True, exist_ok=True)
+  rotate_log(MOUNT_LOG_PATH)   # no mount daemon is alive at this point
   command = [
     rclone, "mount", f"{remote}:", str(mount_path),
     "--daemon",
     "--read-only",
     "--vfs-cache-mode", "full",
     "--vfs-cache-max-age", "6h",
+    "--vfs-cache-max-size", "2G",
     "--dir-cache-time", "5m",
     "--poll-interval", "1m",
-    "--log-file", str(STATE_DIR / "mount.log"),
-    "--log-level", "INFO",
+    "--log-file", str(MOUNT_LOG_PATH),
+    "--log-level", "NOTICE",
   ]
   # rclone --daemon forks and keeps the inherited pipes open, so never wait on
   # its stdout; poll the mount table for the result instead.
@@ -609,14 +1064,16 @@ def bisync_running() -> bool:
 def clear_stale_bisync_lock() -> bool:
   """A bisync killed by a reboot leaves its lock behind, and every later run
   refuses to start. Safe to clear once no bisync process is alive."""
-  locks = list(WORKDIR.glob("*.lck"))
-  if not locks or bisync_running():
-    return False
-  for lock in locks:
-    try:
-      lock.unlink()
-    except OSError:
-      pass
+  dfd = open_owned_dir(WORKDIR, fix_mode=0o700)
+  try:
+    with os.scandir(dfd) as scan:
+      locks = [entry.name for entry in scan if entry.name.endswith(".lck") and entry.is_file(follow_symlinks=False)]
+    if not locks or bisync_running():
+      return False
+    for name in locks:
+      _unlink_quiet(name, dfd)
+  finally:
+    os.close(dfd)
   return True
 
 
@@ -637,8 +1094,7 @@ def do_run(remote_value: str, folder_value: str, force_resync: bool) -> int:
   remote = normalize_remote(remote_value)
   folder = normalize_path(folder_value, "~/Google Drive")
   rclone = rclone_bin()
-  os.close(open_owned_dir(STATE_DIR))
-  os.close(open_owned_dir(WORKDIR))
+  ensure_state_dir()
 
   lock = open_lock_file(LOCK_PATH)
   try:
@@ -668,9 +1124,12 @@ def do_run(remote_value: str, folder_value: str, force_resync: bool) -> int:
                 lastError=f"{folder} is a {fs_type} mount; the synced folder must be a plain directory")
     return 1
 
-  folder.mkdir(parents=True, exist_ok=True)
+  # The sync root must be a real directory of ours; bisync would happily
+  # follow a link planted there to wherever it points.
+  os.close(open_owned_dir(folder))
   if clear_stale_bisync_lock():
     print("cleared a bisync lock left by an interrupted run", file=sys.stderr)
+  rotate_log(LOG_PATH)   # under the flock: nothing else writes the log now
   sync_filters_file(selection)
   filters_now = filters_hash()
   state = load_state()
@@ -689,7 +1148,7 @@ def do_run(remote_value: str, folder_value: str, force_resync: bool) -> int:
 
   ok = code == 0
   message = clean_text(err or out or "")
-  if not ok and not resync and needs_resync(message):
+  if not ok and not resync and needs_resync(code):
     # Steady-state run rejected; retry once with a baseline instead of
     # leaving the folder stuck until someone notices.
     code, out, err = run(bisync_command(rclone, remote, folder, True), timeout=7200)
@@ -700,10 +1159,7 @@ def do_run(remote_value: str, folder_value: str, force_resync: bool) -> int:
 
   detail = message
   if not ok and not detail:
-    try:
-      detail = clean_text(LOG_PATH.read_text(encoding="utf-8", errors="replace")[-4000:])
-    except OSError:
-      detail = ""
+    detail = clean_text(ANSI.sub("", tail_bytes(LOG_PATH, 4000)))
   offline = not ok and looks_offline(detail)
 
   patch_state(
@@ -735,7 +1191,7 @@ def folders_payload(remote_value: str, folder_value: str) -> dict[str, Any]:
   if error:
     return {"ok": False, "folders": [], "lastError": error}
 
-  local = local_top_level(folder)
+  local, approx = local_top_level(folder)
   root_count, root_bytes, _ = remote_root_files(rclone, remote)
   chosen = set(selection["folders"])
   rows = [
@@ -744,12 +1200,13 @@ def folders_payload(remote_value: str, folder_value: str) -> dict[str, Any]:
       "selected": name in chosen,
       "localBytes": local.get(name, 0),
       "onDisk": name in local,
+      "approx": approx,
     }
     for name in names
   ]
   # A folder that was deselected but still occupies disk is worth surfacing.
   stale = [
-    {"name": name, "selected": False, "localBytes": size, "onDisk": True, "stale": True}
+    {"name": name, "selected": False, "localBytes": size, "onDisk": True, "stale": True, "approx": approx}
     for name, size in sorted(local.items(), key=lambda item: item[0].casefold())
     if name not in {row["name"] for row in rows}
   ]
@@ -761,6 +1218,7 @@ def folders_payload(remote_value: str, folder_value: str) -> dict[str, Any]:
     "rootFileBytes": root_bytes,
     "staleBytes": sum(row["localBytes"] for row in rows if not row["selected"] and row["onDisk"])
       + sum(row["localBytes"] for row in stale),
+    "localBytesApprox": approx,
     "lastError": "",
   }
 
@@ -785,6 +1243,7 @@ def status_payload(remote_value: str, folder_value: str, mount_value: str) -> di
     "selectedCount": len(selection["folders"]),
     "rootFiles": selection["rootFiles"],
     "localBytes": 0,
+    "localBytesApprox": False,
     "usedBytes": 0,
     "quotaBytes": 0,
     "usagePercent": 0,
@@ -814,7 +1273,18 @@ def status_payload(remote_value: str, folder_value: str, mount_value: str) -> di
   payload["timerEnabled"] = timer_enabled()
   payload["unitsInstalled"] = (UNIT_DIR / SERVICE).exists() and (UNIT_DIR / TIMER).exists()
   payload["syncing"] = service_active()
-  payload["localBytes"] = directory_bytes(folder) if folder.is_dir() else 0
+  cache = load_cache()
+  cached = cache.get("localBytes") if isinstance(cache.get("localBytes"), dict) else None
+  if payload["syncing"] and cached is not None:
+    # The tree is churning and the panel polls every few seconds: the last
+    # figure will do until the run ends.
+    payload["localBytes"] = clamp_int(cached.get("bytes"))
+    payload["localBytesApprox"] = True
+  else:
+    size, approx = directory_bytes(folder) if folder.is_dir() else (0, False)
+    payload["localBytes"] = size
+    payload["localBytesApprox"] = approx
+    cache["localBytes"] = {"bytes": size, "approx": approx, "ts": int(time.time())}
 
   if config_error:
     payload["statusText"] = "Configuration unavailable"
@@ -830,9 +1300,13 @@ def status_payload(remote_value: str, folder_value: str, mount_value: str) -> di
     payload["lastError"] = f"{folder} is mounted as {fs_type}; unmount it to sync into it"
     return payload
 
-  used, total, quota_known, warning = storage_usage(rclone, remote)
+  used, total, quota_known, warning = storage_usage(rclone, remote, cache)
   payload.update(usedBytes=used, quotaBytes=total, quotaKnown=quota_known,
                  usagePercent=(used / total * 100) if total > 0 else 0, warning=warning)
+  try:
+    save_cache(cache)
+  except (OSError, RuntimeError):
+    pass
 
   if payload["syncing"]:
     payload["statusText"] = "Syncing…"
@@ -857,7 +1331,12 @@ def cmd_select(args: argparse.Namespace) -> None:
   if args.set is not None:
     folders = {name for name in args.set if name.strip()}
   folders.update(args.add or [])
+  for name in folders:
+    if not valid_drive_name(name):
+      raise ValueError(f"Folder name not allowed: {clean_text(name, 60)!r}")
   folders.difference_update(args.remove or [])
+  if len(folders) > MAX_LIST_ENTRIES:
+    raise ValueError(f"At most {MAX_LIST_ENTRIES} folders can be selected")
   selection["folders"] = sorted(folders, key=str.casefold)
   if args.root_files is not None:
     selection["rootFiles"] = args.root_files
@@ -866,7 +1345,7 @@ def cmd_select(args: argparse.Namespace) -> None:
   print(json.dumps({"ok": True, "folders": selection["folders"], "rootFiles": selection["rootFiles"]}))
 
 
-def cmd_cleanup(args: argparse.Namespace) -> None:
+def cmd_cleanup(args: argparse.Namespace) -> int:
   """Delete local copies of deselected folders, but only after proving the
   files still exist on Drive. Nothing is removed on a failed check, and the
   check and the removal share one open directory descriptor, so whatever the
@@ -879,13 +1358,13 @@ def cmd_cleanup(args: argparse.Namespace) -> None:
 
   selection = load_selection()
   chosen = set(selection["folders"])
-  local = local_top_level(folder)
+  local, _ = local_top_level(folder)
   targets = [name for name in sorted(local, key=str.casefold) if name not in chosen]
   if args.only:
     targets = [name for name in targets if name in set(args.only)]
   if not targets:
     print(json.dumps({"ok": True, "removed": [], "freedBytes": 0}))
-    return
+    return 0
 
   removed: list[str] = []
   freed = 0
@@ -911,6 +1390,7 @@ def cmd_cleanup(args: argparse.Namespace) -> None:
           [rclone, "check", fd_path, f"{remote}:{name}", "--one-way", "--drive-skip-gdocs"],
           timeout=1800,
           pass_fds=(dfd,),
+          max_stderr=CHECK_STDERR_BYTES,   # one line per differing file, and the remote decides how many
         )
         if code != 0:
           reason = (err or out or "verification failed").replace(fd_path, str(folder / name))
@@ -933,6 +1413,11 @@ def cmd_cleanup(args: argparse.Namespace) -> None:
     os.close(folder_fd)
 
   print(json.dumps({"ok": not refused, "removed": removed, "freedBytes": freed, "refused": refused}))
+  if refused:
+    # The panel only reads stderr of a failed control command: say why.
+    print(f"Kept {len(refused)} folder(s): {refused[0]['reason']}", file=sys.stderr)
+    return 1
+  return 0
 
 
 def write_timer_interval(minutes: int) -> None:
@@ -1056,7 +1541,12 @@ def parser() -> argparse.ArgumentParser:
 
 def main() -> int:
   args = parser().parse_args()
+  # The widget's watchdog stops a stuck helper with SIGTERM; whatever rclone
+  # it was waiting on goes with it rather than running on unattended.
+  for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(signum, _on_signal)
   try:
+    ensure_state_dir()
     if args.command == "status":
       print(json.dumps(status_payload(args.remote, args.folder, args.mount)))
     elif args.command == "folders":
@@ -1072,7 +1562,7 @@ def main() -> int:
         patch_state(forceResync=False)
       return do_run(args.remote, args.folder, forced)
     elif args.command == "cleanup":
-      cmd_cleanup(args)
+      return cmd_cleanup(args)
     elif args.command == "mount":
       mount_browse(normalize_remote(args.remote), normalize_path(args.mount, "~/GDrive-Browse"))
     elif args.command == "unmount":

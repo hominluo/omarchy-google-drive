@@ -23,6 +23,7 @@ Item {
   property int selectedCount: 0
   property bool rootFiles: true
   property double localBytes: 0
+  property bool localBytesApprox: false
   property double usedBytes: 0
   property double quotaBytes: 0
   property bool quotaKnown: false
@@ -141,6 +142,7 @@ Item {
     selectedCount = Number(parsed.selectedCount || 0)
     rootFiles = parsed.rootFiles !== false
     localBytes = Number(parsed.localBytes || 0)
+    localBytesApprox = parsed.localBytesApprox === true
     usedBytes = Number(parsed.usedBytes || 0)
     quotaBytes = Number(parsed.quotaBytes || 0)
     quotaKnown = parsed.quotaKnown === true
@@ -185,7 +187,8 @@ Item {
     pendingFolders = copy
 
     note(next ? "Adding " + name + "…" : "Removing " + name + " from sync…")
-    runControl(baseArgs("select").concat([next ? "--add" : "--remove", name]), function () {
+    // `--add=NAME`: a folder called "-Something" must not read as an option.
+    runControl(baseArgs("select").concat([(next ? "--add=" : "--remove=") + name]), function () {
       root.refreshFolders()
       root.refresh()
     })
