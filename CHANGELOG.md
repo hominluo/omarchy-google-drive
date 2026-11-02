@@ -1,5 +1,35 @@
 # Changelog
 
+## 1.0.3 — 2026-11-01
+
+Correctness fixes from a full review of the backend, the QML front end and the
+systemd units.
+
+- A folder inside `$HOME` no longer becomes unusable when `$HOME` is reached
+  through a symlink (`/home` → `/var/home` on ostree installs); both the
+  written and the resolved home are accepted.
+- A selected folder that Drive no longer lists stays ticked and is marked
+  "Not in Drive", so it can be unticked again. It is no longer counted as
+  reclaimable space or deleted by cleanup while it is still selected.
+- The systemd units follow the configured folder, remote, mount and interval.
+  Changing one in the bar settings used to leave the timer syncing the old
+  path; the interval drop-in is now rewritten only when it differs.
+- Cleanup takes the same lock as a sync run, so bisync can no longer write
+  into a tree that is being emptied. A removal that fails after some entries
+  are already gone reports `partial: true`, and the whole run is bounded by a
+  one-hour deadline.
+- Loose files at the top of Drive are counted, shown, and cleaned up when
+  "Loose files at the top of Drive" is off — they used to be invisible to
+  both the size totals and cleanup.
+- A failed `status` no longer flips the panel to "rclone required": the last
+  good connection state is kept, and the error is reported instead.
+- Turning on the browse mount restarts an enabled-but-dead unit and fails
+  loudly when the mount never comes up; the panel re-reads the status six
+  seconds later so a mount that disappears is not shown as "Browsing".
+- The QML watchdogs now sit above the backend's own worst-case budgets
+  (status 150s, folders 240s, control 70 min); a healthy but slow run is no
+  longer killed and reported as a timeout.
+
 ## 1.0.2 — 2026-09-18
 
 Security hardening after the second marketplace review.

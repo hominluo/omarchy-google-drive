@@ -71,6 +71,7 @@ LOG_TAIL_BYTES = 16384
 MAX_WALK_ENTRIES = 100_000
 MAX_WALK_SECONDS = 2.0
 ABOUT_CACHE_SECONDS = 60
+CLEANUP_TIMEOUT = 3600          # whole cleanup run: one folder may not starve the rest
 EXIT_TIMEOUT = 124
 EXIT_TOO_LARGE = 125
 # bisync's "must run --resync" abort is a FatalError (exit 7 in current
@@ -422,8 +423,12 @@ def normalize_path(value: str, fallback: str) -> Path:
   path = Path(os.path.expandvars(os.path.expanduser(value or fallback)))
   path = path if path.is_absolute() else (Path.home() / path)
   resolved = Path(os.path.normpath(str(path)))
-  home = Path.home().resolve()
-  if resolved in (Path("/"), home) or home not in resolved.parents:
+  # Both forms of home count: `$HOME` itself may be reached through a symlink
+  # (/home -> /var/home), and then the resolved home is never a parent of the
+  # path as written, nor the other way round.
+  home = Path.home()
+  real_home = home.resolve()
+  if resolved in (Path("/"), home, real_home) or (home not in resolved.parents and real_home not in resolved.parents):
     raise ValueError("Choose a folder inside your home directory, not the home directory itself")
   if CONTROL.search(str(resolved)):
     raise ValueError("Folder path contains control characters")
@@ -552,24 +557,45 @@ def open_lock_file(path: Path):
   return os.fdopen(fd, "r+")
 
 
-def remove_tree_contents(dfd: int, dev: int) -> None:
+def take_sync_lock(busy: str):
+  """The exclusive lock a run takes on the synced folder, non-blocking and
+  held until this process exits. `busy` is raised when someone else has it."""
+  lock = open_lock_file(LOCK_PATH)
+  try:
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+  except OSError as error:
+    if error.errno in (errno.EACCES, errno.EAGAIN):
+      lock.close()
+      raise RuntimeError(busy) from error
+    lock.close()
+    raise
+  return lock
+
+
+def remove_tree_contents(dfd: int, dev: int, tally: list[int] | None = None) -> int:
   """Empty the directory behind `dfd` relative to that descriptor: symlinks
   are unlinked rather than followed, names are never re-resolved from the
-  root, and a second filesystem is never crossed."""
+  root, and a second filesystem is never crossed. Returns how many entries it
+  removed; `tally` is updated as each one goes, so a caller can tell a failure
+  that came after a partial removal."""
+  removed = tally if tally is not None else [0]
   with os.scandir(dfd) as scan:
     entries = [(entry.name, entry.is_dir(follow_symlinks=False)) for entry in scan]
   for name, is_dir in entries:
     if not is_dir:
       os.unlink(name, dir_fd=dfd)
-      continue
-    child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dfd)
-    try:
-      if os.fstat(child).st_dev != dev:
-        raise RuntimeError(f"{name} is on another filesystem; refusing to remove it")
-      remove_tree_contents(child, dev)
-    finally:
-      os.close(child)
-    os.rmdir(name, dir_fd=dfd)
+      removed[0] += 1
+    else:
+      child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dfd)
+      try:
+        if os.fstat(child).st_dev != dev:
+          raise RuntimeError(f"{name} is on another filesystem; refusing to remove it")
+        remove_tree_contents(child, dev, removed)
+      finally:
+        os.close(child)
+      os.rmdir(name, dir_fd=dfd)
+      removed[0] += 1
+  return removed[0]
 
 
 def write_json(path: Path, payload: Any) -> None:
@@ -919,18 +945,19 @@ def directory_bytes(path: Path, budget: WalkBudget | None = None) -> tuple[int, 
   return total, budget.exhausted
 
 
-def local_top_level(folder: Path) -> tuple[dict[str, int], bool]:
-  """Bytes on disk per top-level entry of the synced folder; (sizes,
-  approximate). Each folder gets its own entry budget under one shared
+def local_top_level(folder: Path) -> tuple[dict[str, int], dict[str, int], bool]:
+  """Bytes on disk per top-level entry of the synced folder: (folders, loose
+  files, approximate). Each folder gets its own entry budget under one shared
   clock, so one huge folder cannot zero out the ones walked after it: a
   folder that is on disk is always listed, at worst with a cut-short size."""
   sizes: dict[str, int] = {}
+  files: dict[str, int] = {}
   approx = False
   deadline = time.monotonic() + MAX_WALK_SECONDS
   try:
     entries = list(os.scandir(folder))
   except OSError:
-    return sizes, False
+    return sizes, files, False
   for entry in entries:
     if entry.name in SKIP_LOCAL or not valid_drive_name(entry.name):
       continue
@@ -939,9 +966,11 @@ def local_top_level(folder: Path) -> tuple[dict[str, int], bool]:
         budget = WalkBudget(max_entries=MAX_WALK_ENTRIES, max_seconds=max(0.05, deadline - time.monotonic()))
         sizes[entry.name], cut = directory_bytes(Path(entry.path), budget)
         approx = approx or cut
+      elif entry.is_file(follow_symlinks=False):
+        files[entry.name] = entry.stat(follow_symlinks=False).st_size
     except OSError:
       continue
-  return sizes, approx
+  return sizes, files, approx
 
 
 # ---------------------------------------------------------------- mount side
@@ -1119,14 +1148,12 @@ def do_run(remote_value: str, folder_value: str, force_resync: bool) -> int:
   rclone = rclone_bin()
   ensure_state_dir()
 
-  lock = open_lock_file(LOCK_PATH)
   try:
-    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-  except OSError as error:
-    if error.errno in (errno.EACCES, errno.EAGAIN):
-      print("another sync is already running", file=sys.stderr)
-      return 0
-    raise
+    lock = take_sync_lock("another sync is already running")   # keeps the flock until exit
+  except RuntimeError as error:
+    # A timer run landing on a manual one is not a failure.
+    print(error, file=sys.stderr)
+    return 0
 
   selection = load_selection()
   if not selection["folders"] and not selection["rootFiles"]:
@@ -1214,7 +1241,7 @@ def folders_payload(remote_value: str, folder_value: str) -> dict[str, Any]:
   if error:
     return {"ok": False, "folders": [], "lastError": error}
 
-  local, approx = local_top_level(folder)
+  local, loose, approx = local_top_level(folder)
   root_count, root_bytes, _ = remote_root_files(rclone, remote)
   chosen = set(selection["folders"])
   rows = [
@@ -1227,27 +1254,47 @@ def folders_payload(remote_value: str, folder_value: str) -> dict[str, Any]:
     }
     for name in names
   ]
-  # A folder that was deselected but still occupies disk is worth surfacing.
+  listed = {row["name"] for row in rows}
+  # On disk but not in the listing: either deselected (a cleanup candidate) or
+  # still selected while Drive no longer has it under that name. Only the
+  # first is "still on disk because you stopped syncing it"; a missing one
+  # stays ticked so the panel can still untick it.
   stale = [
-    {"name": name, "selected": False, "localBytes": size, "onDisk": True, "stale": True, "approx": approx}
+    {
+      "name": name,
+      "selected": name in chosen,
+      "localBytes": size,
+      "onDisk": True,
+      "stale": name not in chosen,
+      "missing": name in chosen,
+      "approx": approx,
+    }
     for name, size in sorted(local.items(), key=lambda item: item[0].casefold())
-    if name not in {row["name"] for row in rows}
+    if name not in listed
   ]
+  deselect = [row for row in stale if row["stale"]]
+  # Loose files at the top only stay behind when root files are not synced.
+  root_local = sum(loose.values()) if not selection["rootFiles"] else 0
+  root_local_count = len(loose) if not selection["rootFiles"] else 0
   return {
     "ok": True,
     "folders": rows + stale,
     "rootFiles": selection["rootFiles"],
     "rootFileCount": root_count,
     "rootFileBytes": root_bytes,
+    "rootLocalBytes": root_local,
+    "rootLocalCount": root_local_count,
     "staleBytes": sum(row["localBytes"] for row in rows if not row["selected"] and row["onDisk"])
-      + sum(row["localBytes"] for row in stale),
-    "staleCount": sum(1 for row in rows if not row["selected"] and row["onDisk"]) + len(stale),
+      + sum(row["localBytes"] for row in deselect) + root_local,
+    "staleCount": sum(1 for row in rows if not row["selected"] and row["onDisk"])
+      + len(deselect) + (1 if root_local_count else 0),
     "localBytesApprox": approx,
     "lastError": "",
   }
 
 
-def status_payload(remote_value: str, folder_value: str, mount_value: str) -> dict[str, Any]:
+def status_payload(remote_value: str, folder_value: str, mount_value: str,
+                   interval_min: int = 0) -> dict[str, Any]:
   remote = normalize_remote(remote_value)
   folder = normalize_path(folder_value, "~/Google Drive")
   mount_path = normalize_path(mount_value, "~/GDrive-Browse")
@@ -1290,11 +1337,27 @@ def status_payload(remote_value: str, folder_value: str, mount_value: str) -> di
 
   remotes, config_error = configured_remotes(rclone)
   payload["authenticated"] = remote in remotes
+  # A folder, remote or mount changed in the bar settings has to reach the
+  # timer too, or the unit keeps syncing the old path forever. Only repair
+  # units that are already installed: a status poll must not create them for
+  # someone who never enabled sync. ensure_units rewrites only what differs.
+  if (UNIT_DIR / SERVICE).exists() or (UNIT_DIR / TIMER).exists():
+    try:
+      ensure_units(remote, folder, mount_path)
+    except (OSError, RuntimeError, ValueError):
+      pass
   browse_state = mount_info(mount_path)
   payload["browseMounted"] = browse_state[1] and browse_state[3]
   payload["browseStale"] = browse_state[1] and not browse_state[3]
   payload["browseEnabled"] = unit_enabled(BROWSE_SERVICE)
   payload["timerEnabled"] = timer_enabled()
+  if payload["timerEnabled"] and interval_min > 0:
+    # Same reason as ensure_units: the interval lives only in a drop-in, and
+    # nothing else writes it once the timer is already on.
+    try:
+      write_timer_interval(interval_min)
+    except (OSError, RuntimeError, ValueError):
+      pass
   payload["unitsInstalled"] = (UNIT_DIR / SERVICE).exists() and (UNIT_DIR / TIMER).exists()
   payload["syncing"] = service_active()
   cache = load_cache()
@@ -1349,6 +1412,43 @@ def status_payload(remote_value: str, folder_value: str, mount_value: str) -> di
 
 # ---------------------------------------------------------------- commands
 
+def error_payload(command: str, message: str) -> dict[str, Any]:
+  """What the widget reads when a command failed before it could answer. Every
+  key the panel looks at is present, and `installed` is still the truth: a bad
+  folder path must not make the panel claim rclone is missing."""
+  if command == "folders":
+    return {"ok": False, "folders": [], "lastError": message}
+  return {
+    "ok": False,
+    "installed": rclone_bin() is not None,
+    "authenticated": False,
+    "syncing": False,
+    "statusText": "Unavailable",
+    "folderPath": "",
+    "mountPath": "",
+    "remoteName": "",
+    "selectedCount": 0,
+    "rootFiles": True,
+    "localBytes": 0,
+    "localBytesApprox": False,
+    "usedBytes": 0,
+    "quotaBytes": 0,
+    "usagePercent": 0,
+    "quotaKnown": False,
+    "browseMounted": False,
+    "browseStale": False,
+    "browseEnabled": False,
+    "timerEnabled": False,
+    "unitsInstalled": False,
+    "lastResult": "",
+    "lastFinishedTs": 0,
+    "lastDurationSec": 0,
+    "baseline": False,
+    "warning": "",
+    "lastError": message,
+  }
+
+
 def cmd_select(args: argparse.Namespace) -> None:
   selection = load_selection()
   folders = set(selection["folders"])
@@ -1370,29 +1470,43 @@ def cmd_select(args: argparse.Namespace) -> None:
 
 
 def cmd_cleanup(args: argparse.Namespace) -> int:
-  """Delete local copies of deselected folders, but only after proving the
-  files still exist on Drive. Nothing is removed on a failed check, and the
-  check and the removal share one open directory descriptor, so whatever the
-  name points at by the time the check finishes is never what gets deleted."""
+  """Delete local copies of deselected folders and of loose root files, but
+  only after proving the files still exist on Drive. Nothing is removed on a
+  failed check, and the check and the removal share one open directory
+  descriptor, so whatever the name points at by the time the check finishes is
+  never what gets deleted. The sync lock is held throughout, so no bisync can
+  write into a tree while it is being emptied."""
   remote = normalize_remote(args.remote)
   folder = normalize_path(args.folder, "~/Google Drive")
   rclone = rclone_bin()
   if not rclone:
     raise RuntimeError("rclone is not installed")
+  lock = take_sync_lock("a sync is running; clean up again when it finishes")
+  try:
+    return cleanup_locked(remote, folder, rclone, args.only or [])
+  finally:
+    lock.close()
 
+
+def cleanup_locked(remote: str, folder: Path, rclone: str, only: list[str]) -> int:
   selection = load_selection()
   chosen = set(selection["folders"])
-  local, _ = local_top_level(folder)
+  local, loose, _ = local_top_level(folder)
   targets = [name for name in sorted(local, key=str.casefold) if name not in chosen]
-  if args.only:
-    targets = [name for name in targets if name in set(args.only)]
-  if not targets:
+  # Loose files are only ours to remove when root files are not synced.
+  file_targets = [name for name in sorted(loose, key=str.casefold) if not selection["rootFiles"]]
+  if only:
+    wanted = set(only)
+    targets = [name for name in targets if name in wanted]
+    file_targets = [name for name in file_targets if name in wanted]
+  if not targets and not file_targets:
     print(json.dumps({"ok": True, "removed": [], "freedBytes": 0}))
     return 0
 
   removed: list[str] = []
   freed = 0
-  refused: list[dict[str, str]] = []
+  refused: list[dict[str, Any]] = []
+  deadline = time.monotonic() + CLEANUP_TIMEOUT
   folder_fd = open_owned_dir(folder)
   try:
     folder_dev = os.fstat(folder_fd).st_dev
@@ -1412,7 +1526,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
         fd_path = f"/proc/self/fd/{dfd}"
         code, out, err = run(
           [rclone, "check", fd_path, f"{remote}:{name}", "--one-way", "--drive-skip-gdocs"],
-          timeout=1800,
+          timeout=max(30.0, deadline - time.monotonic()),
           pass_fds=(dfd,),
           max_stderr=CHECK_STDERR_BYTES,   # one line per differing file, and the remote decides how many
         )
@@ -1420,41 +1534,89 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
           reason = (err or out or "verification failed").replace(fd_path, str(folder / name))
           refused.append({"name": name, "reason": clean_text(reason)})
           continue
+        gone = [0]
         try:
-          remove_tree_contents(dfd, folder_dev)
+          remove_tree_contents(dfd, folder_dev, gone)
           current = os.stat(name, dir_fd=folder_fd, follow_symlinks=False)
           if (current.st_dev, current.st_ino) != identity:
             raise RuntimeError("folder changed during cleanup")
           os.rmdir(name, dir_fd=folder_fd)
         except (OSError, RuntimeError) as error:
-          refused.append({"name": name, "reason": clean_text(str(error))})
+          entry: dict[str, Any] = {"name": name, "reason": clean_text(str(error))}
+          if gone[0]:
+            entry["partial"] = True   # the folder is still there, but not whole
+          refused.append(entry)
           continue
       finally:
         os.close(dfd)
       removed.append(name)
       freed += local.get(name, 0)
+
+    for name in file_targets:
+      try:
+        info = os.stat(name, dir_fd=folder_fd, follow_symlinks=False)
+      except OSError:
+        continue  # gone, or no longer a plain file
+      if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+        refused.append({"name": name, "reason": "not a plain file owned by you"})
+        continue
+      identity = (info.st_dev, info.st_ino)
+      # The same proof as for a folder: the sync root through its descriptor,
+      # narrowed to this one name, against the root of the Drive.
+      fd_path = f"/proc/self/fd/{folder_fd}"
+      code, out, err = run(
+        [rclone, "check", fd_path, f"{remote}:", "--one-way", "--drive-skip-gdocs",
+         "--filter", "+ /" + escape_glob(name), "--filter", "- **"],
+        timeout=max(30.0, deadline - time.monotonic()),
+        pass_fds=(folder_fd,),
+        max_stderr=CHECK_STDERR_BYTES,
+      )
+      if code != 0:
+        reason = (err or out or "verification failed").replace(fd_path, str(folder))
+        refused.append({"name": name, "reason": clean_text(reason)})
+        continue
+      try:
+        current = os.stat(name, dir_fd=folder_fd, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != identity:
+          raise RuntimeError("file changed during cleanup")
+        os.unlink(name, dir_fd=folder_fd)
+      except (OSError, RuntimeError) as error:
+        refused.append({"name": name, "reason": clean_text(str(error))})
+        continue
+      removed.append(name)
+      freed += loose.get(name, 0)
   finally:
     os.close(folder_fd)
 
   print(json.dumps({"ok": not refused, "removed": removed, "freedBytes": freed, "refused": refused}))
   if refused:
     # The panel only reads stderr of a failed control command: say why.
-    print(f"Kept {len(refused)} folder(s): {refused[0]['reason']}", file=sys.stderr)
+    first = refused[0]
+    detail = first["reason"] + (" (partly deleted first)" if first.get("partial") else "")
+    print(f"Kept {len(refused)} item(s): {detail}", file=sys.stderr)
     return 1
   return 0
 
 
-def write_timer_interval(minutes: int) -> None:
-  """Override the shipped cadence with a drop-in, leaving the unit itself alone."""
+def write_timer_interval(minutes: int) -> bool:
+  """Override the shipped cadence with a drop-in, leaving the unit itself
+  alone. Returns True only when the drop-in actually changed, so a status poll
+  can ask on every tick without a write or a daemon-reload each time."""
   value = max(1, min(1440, int(minutes)))
-  write_atomic(
-    UNIT_DIR / (TIMER + ".d") / "interval.conf",
+  path = UNIT_DIR / (TIMER + ".d") / "interval.conf"
+  text = (
     "# Generated by the Omarchy Google Drive widget.\n"
     "[Timer]\n"
-    f"OnUnitInactiveSec={value}min\n",
-    mode=0o644,
+    f"OnUnitInactiveSec={value}min\n"
   )
+  try:
+    if path.read_text(encoding="utf-8") == text:
+      return False
+  except OSError:
+    pass
+  write_atomic(path, text, mode=0o644)
   run(["systemctl", "--user", "daemon-reload"], timeout=25)
+  return True
 
 
 def units_from_args(args: argparse.Namespace) -> None:
@@ -1465,14 +1627,33 @@ def units_from_args(args: argparse.Namespace) -> None:
   )
 
 
+def browse_live(path: Path) -> bool:
+  """The browse mount is present and its daemon answers. Without findmnt
+  there is no way to tell, and the status payload says so elsewhere: assume
+  it is up rather than restarting a healthy mount on every toggle."""
+  if not shutil.which("findmnt"):
+    return True
+  mounted, by_rclone, _, alive = mount_info(path)
+  return by_rclone and alive
+
+
 def cmd_browse(args: argparse.Namespace) -> None:
   """Enable/disable the browse mount as a unit, so the choice survives a
   reboot instead of living only in this session's mount table."""
   units_from_args(args)
-  action = ["enable", "--now"] if args.enable else ["disable", "--now"]
+  mount_path = normalize_path(args.mount, "~/GDrive-Browse")
+  # `enable --now` is a no-op on a unit that is already active, and an active
+  # unit whose mount daemon died is exactly what an unclean boot leaves. Cycle
+  # it, so "on" really means mounted.
+  if args.enable and unit_enabled(BROWSE_SERVICE) and not browse_live(mount_path):
+    action = ["restart"]
+  else:
+    action = ["enable", "--now"] if args.enable else ["disable", "--now"]
   code, out, err = run(["systemctl", "--user", *action, BROWSE_SERVICE], timeout=90)
   if code != 0:
     raise RuntimeError(clean_text(err or out or "Could not change the browse mount"))
+  if args.enable and not browse_live(mount_path):
+    raise RuntimeError("The browse mount did not come up; see mount.log")
   print(json.dumps({"ok": True, "browseEnabled": unit_enabled(BROWSE_SERVICE)}))
 
 
@@ -1508,6 +1689,9 @@ def parser() -> argparse.ArgumentParser:
   status.add_argument("--remote", default="gdrive")
   status.add_argument("--folder", default="~/Google Drive")
   status.add_argument("--mount", default="~/GDrive-Browse")
+  # The widget sends its configured cadence so a changed value reaches the
+  # timer drop-in; 0 means "no opinion".
+  status.add_argument("--interval", type=int, default=0)
 
   folders = commands.add_parser("folders")
   folders.add_argument("--remote", default="gdrive")
@@ -1572,7 +1756,7 @@ def main() -> int:
   try:
     ensure_state_dir()
     if args.command == "status":
-      print(json.dumps(status_payload(args.remote, args.folder, args.mount)))
+      print(json.dumps(status_payload(args.remote, args.folder, args.mount, args.interval)))
     elif args.command == "folders":
       print(json.dumps(folders_payload(args.remote, args.folder)))
     elif args.command == "select":
@@ -1597,7 +1781,7 @@ def main() -> int:
       cmd_timer(args)
   except (OSError, RuntimeError, ValueError) as error:
     if args.command in ("status", "folders"):
-      print(json.dumps({"ok": False, "lastError": clean_text(str(error)), "folders": []}))
+      print(json.dumps(error_payload(args.command, clean_text(str(error)))))
       return 0
     print(clean_text(str(error)), file=sys.stderr)
     return 1

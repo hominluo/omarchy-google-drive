@@ -135,7 +135,7 @@ Left click opens it, right click refreshes.
 | `b` | Mount / unmount the browse view |
 | `o` | Open the synced folder |
 | `r` | Refresh |
-| `c` | Clean up folders you stopped syncing |
+| `c` | Clean up folders and files you stopped syncing |
 | Escape | Close |
 
 **Browse all** mounts your whole Drive read-only at `~/GDrive-Browse` without
@@ -143,10 +143,11 @@ downloading it — for reaching something you never synced. Right-click it to op
 the folder instead of toggling it.
 
 Unticking a folder only *stops syncing* it. The files stay, and the panel says
-how much room they take. **Clean up** deletes them, but only after
-`rclone check --one-way` proves every local file still exists in Drive; a folder
-that fails the check is left alone and reported. Nothing is deleted on an
-unverified path.
+how much room they take. Turning off **Loose files at the top of Drive** does the
+same for files in the root of the folder. **Clean up** deletes both, but only
+after `rclone check --one-way` proves every local file still exists in Drive; an
+entry that fails the check is left alone and reported. Nothing is deleted on an
+unverified path, and cleanup waits while a sync is running.
 
 Google-native files — Docs, Sheets, Slides — are skipped. They have no real file
 to store; open them in a browser.
@@ -212,7 +213,9 @@ logged out: `sudo loginctl enable-linger "$USER"`.
   Every command is executed as an argument array, never an interpolated shell
   string.
 - It writes two systemd user units, and only when you first enable sync or the
-  browse mount. Both are listed under [Uninstall](#uninstall).
+  browse mount. They are rewritten whenever the remote, an in-unit path or the
+  sync interval differs from what is on disk, so changing a setting in the bar
+  takes effect on the next run. Both are listed under [Uninstall](#uninstall).
 - The interpreter baked into those units is `/usr/bin/python3` on purpose: a
   systemd user unit doesn't inherit the PATH that mise, pyenv or asdf put their
   shims on, and those paths move on every version bump.

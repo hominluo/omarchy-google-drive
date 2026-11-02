@@ -269,7 +269,7 @@ Panel {
           }
 
           SetupNotice {
-            visible: !drive.authenticated
+            visible: !drive.authenticated && drive.statusOk
             width: parent.width
           }
 
@@ -400,7 +400,7 @@ Panel {
               Text {
                 textFormat: Text.PlainText
                 Layout.fillWidth: true
-                text: Model.formatBytes(drive.staleBytes) + " is still on disk for folders you stopped syncing."
+                text: Model.formatBytes(drive.staleBytes) + " is still on disk for folders and files you stopped syncing."
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
@@ -585,7 +585,8 @@ Panel {
         Text {
           textFormat: Text.PlainText
           Layout.fillWidth: true
-          text: Model.rootFilesMeta(drive.rootFileCount, drive.rootFileBytes)
+          text: Model.rootFilesMeta(drive.rootFileCount, drive.rootFileBytes,
+                                    drive.rootLocalCount, drive.rootLocalBytes)
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption

@@ -17,6 +17,7 @@ Item {
   property bool browseStale: false
   property bool browseEnabled: false
   property bool syncBaseline: false
+  property bool statusOk: true
   property string statusText: "Checking…"
   property string folderPath: ""
   property string mountPath: ""
@@ -38,6 +39,8 @@ Item {
   property int staleCount: 0
   property int rootFileCount: 0
   property double rootFileBytes: 0
+  property double rootLocalBytes: 0
+  property int rootLocalCount: 0
   property bool foldersLoading: false
   property string foldersError: ""
 
@@ -106,7 +109,10 @@ Item {
     statusProcess.command = baseArgs("status").concat([
       "--remote", remoteName,
       "--folder", configuredFolder,
-      "--mount", configuredMount
+      "--mount", configuredMount,
+      // Lets the backend bring the timer's drop-in back in line with the
+      // configured cadence without waiting for the switch to be toggled.
+      "--interval", String(syncIntervalMin)
     ])
     statusProcess.running = true
     statusWatchdog.restart()
@@ -125,10 +131,17 @@ Item {
 
   function applyStatus(raw) {
     var parsed = Model.parseStatus(raw)
-    if (parsed.ok === false && parsed.lastError) {
-      lastError = parsed.lastError
+    if (parsed.ok === false) {
+      // The backend could not answer at all (a folder path outside $HOME, an
+      // unreadable state directory). Keep the last good connection state and
+      // say what failed; a missing key is not "rclone is gone".
+      statusOk = false
+      lastError = String(parsed.lastError || "Google Drive status is unavailable")
+      statusText = String(parsed.statusText || "Unavailable")
+      if (parsed.installed === true) installed = true
       return
     }
+    statusOk = true
     installed = parsed.installed === true
     authenticated = parsed.authenticated === true
     syncing = parsed.syncing === true
@@ -168,6 +181,8 @@ Item {
     staleCount = Number(parsed.staleCount || 0)
     rootFileCount = Number(parsed.rootFileCount || 0)
     rootFileBytes = Number(parsed.rootFileBytes || 0)
+    rootLocalBytes = Number(parsed.rootLocalBytes || 0)
+    rootLocalCount = Number(parsed.rootLocalCount || 0)
     rootFiles = parsed.rootFiles !== false
     foldersError = ""
     pendingFolders = ({})
@@ -232,7 +247,7 @@ Item {
     _desiredBrowse = turningOn ? 1 : 0
     note(turningOn ? "Mounting browse folder…" : "Unmounting browse folder…")
     runControl(unitArgs("browse").concat([turningOn ? "--enable" : "--disable"]),
-               function () { root.refresh() })
+               function () { root.refresh(); browseSettle.restart() })
   }
 
   function cleanupStale() {
@@ -315,9 +330,27 @@ Item {
     onTriggered: root.actionStatus = ""
   }
 
+  // A command that exits 0 is not proof the mount is there: the optimistic
+  // state is dropped a few seconds later so a mount that never came up shows
+  // as off (and can be retried) instead of staying "Browsing" forever.
+  Timer {
+    id: browseSettle
+    interval: 6000
+    repeat: false
+    onTriggered: {
+      root._desiredBrowse = -1
+      root.refresh()
+    }
+  }
+
+  // The watchdogs sit above what the backend allows itself, or a healthy slow
+  // command is killed and reported as a timeout: status can spend 10s on
+  // listremotes, 2x8s on findmnt, 3x6s on systemctl, 25s on `rclone about`,
+  // 2s walking and up to 55s rewriting units (126s); folders 90+90+2s (182s);
+  // a cleanup is bounded by CLEANUP_TIMEOUT plus local removal.
   Timer {
     id: statusWatchdog
-    interval: 45000
+    interval: 150000
     repeat: false
     onTriggered: {
       if (!statusProcess.running) return
@@ -328,7 +361,7 @@ Item {
 
   Timer {
     id: foldersWatchdog
-    interval: 120000
+    interval: 240000
     repeat: false
     onTriggered: {
       if (!foldersProcess.running) return
@@ -340,7 +373,7 @@ Item {
 
   Timer {
     id: controlWatchdog
-    interval: 1800000
+    interval: 4200000
     repeat: false
     onTriggered: {
       if (!controlProcess.running) return

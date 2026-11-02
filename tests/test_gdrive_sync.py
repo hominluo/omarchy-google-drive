@@ -173,6 +173,7 @@ class CleanupTests(TempDirCase):
       mock.patch.object(mod.Path, "home", return_value=self.home),
       mock.patch.object(mod, "rclone_bin", return_value=str(self.rclone)),
       mock.patch.object(mod, "SELECTION_PATH", state / "selection.json"),
+      mock.patch.object(mod, "LOCK_PATH", state / "sync.lock"),
       mock.patch.dict(os.environ, {"FAKE_LOG": str(self.log), "FAKE_SWAP": "", "FAKE_FAIL": ""}),
     ]
     for patch in self.patches:
@@ -213,7 +214,11 @@ class CleanupTests(TempDirCase):
     os.environ["FAKE_SWAP"] = str(self.folder / "Drop")
     result = self.cleanup()
     self.assertEqual(result["removed"], [])
-    self.assertEqual(result["refused"], [{"name": "Drop", "reason": "folder changed during cleanup"}])
+    # Refused, and says so: the directory it verified was emptied first.
+    self.assertEqual(len(result["refused"]), 1)
+    self.assertEqual(result["refused"][0]["name"], "Drop")
+    self.assertEqual(result["refused"][0]["reason"], "folder changed during cleanup")
+    self.assertTrue(result["refused"][0].get("partial"))
     # The impostor under the name survives untouched…
     self.assertEqual((self.folder / "Drop" / "planted").read_text(), "planted\n")
     # …and only the directory rclone actually verified was emptied.
@@ -493,12 +498,12 @@ class WalkBudgetTests(TempDirCase):
     total, approx = mod.directory_bytes(root, mod.WalkBudget(max_entries=100000, max_seconds=10))
     self.assertEqual((total, approx), (3000, False))
     (root / "bad\nname").mkdir()
-    sizes, _ = mod.local_top_level(root)
+    sizes, _files, _approx = mod.local_top_level(root)
     self.assertNotIn("bad\nname", sizes)
     self.assertEqual(len(sizes), 30)
     # One folder exhausting its budget never zeroes the ones after it.
     with mock.patch.object(mod, "MAX_WALK_ENTRIES", 5):
-      sizes, approx = mod.local_top_level(root)
+      sizes, _files, approx = mod.local_top_level(root)
     self.assertTrue(approx)
     self.assertEqual(len(sizes), 30)
     self.assertTrue(all(size > 0 for size in sizes.values()), sizes)
@@ -566,3 +571,416 @@ class StorageCacheTests(TempDirCase):
     self.assertEqual(len(calls), 1)
     with mock.patch.object(mod, "run", lambda *a, **k: (0, '{"total": Infinity, "used": [1]}', "")):
       self.assertEqual(mod.storage_usage("rclone", "other", {}), (0, 0, False, ""))
+
+
+# ---------------------------------------------------------------- round 3: audit fixes
+
+import fcntl
+import re
+
+
+class NormalizePathTests(TempDirCase):
+  def setUp(self):
+    super().setUp()
+    self.home = self.tmp / "home"
+    self.home.mkdir()
+
+  def test_inside_home_is_accepted_and_outside_is_refused(self):
+    with mock.patch.dict(os.environ, {"HOME": str(self.home)}):
+      self.assertEqual(mod.normalize_path("~/Google Drive", "x"), self.home / "Google Drive")
+      self.assertEqual(mod.normalize_path(str(self.home / "nested" / ".." / "y"), "x"), self.home / "y")
+      for bad in ("/", "~", str(self.home), "/etc", str(self.tmp / "outside")):
+        with self.assertRaises(ValueError):
+          mod.normalize_path(bad, "x")
+
+  def test_a_home_reached_through_a_symlink_still_accepts_its_paths(self):
+    # $HOME is /home/u while /home is a link to /var/home: the path as written
+    # and the resolved one can never be prefixes of each other.
+    real = self.tmp / "var" / "home" / "u"
+    real.mkdir(parents=True)
+    (self.tmp / "home-link").mkdir()
+    link = self.tmp / "home-link" / "u"
+    link.symlink_to(real)
+    with mock.patch.dict(os.environ, {"HOME": str(link)}):
+      self.assertEqual(mod.normalize_path("~/Google Drive", "x"), link / "Google Drive")
+      self.assertEqual(mod.normalize_path(str(link / "Google Drive"), "x"), link / "Google Drive")
+      # The resolved form is still inside home, so it is accepted too.
+      self.assertEqual(mod.normalize_path(str(real / "Google Drive"), "x"), real / "Google Drive")
+      with self.assertRaises(ValueError):
+        mod.normalize_path(str(self.tmp / "elsewhere"), "x")
+
+
+class PayloadCase(TempDirCase):
+  def setUp(self):
+    super().setUp()
+    self.home = self.tmp / "home"
+    self.folder = self.home / "Google Drive"
+    self.folder.mkdir(parents=True)
+    self.state = self.tmp / "state"
+    self.state.mkdir()
+    self.units = self.tmp / "units"
+    for patch in (
+      mock.patch.object(mod.Path, "home", return_value=self.home),
+      mock.patch.object(mod, "SELECTION_PATH", self.state / "selection.json"),
+      mock.patch.object(mod, "STATE_PATH", self.state / "state.json"),
+      mock.patch.object(mod, "CACHE_PATH", self.state / "cache.json"),
+      mock.patch.object(mod, "LOCK_PATH", self.state / "sync.lock"),
+      mock.patch.object(mod, "UNIT_DIR", self.units),
+      mock.patch.object(mod, "rclone_bin", return_value="/bin/true"),
+      mock.patch.object(mod, "remote_root_files", return_value=(0, 0, "")),
+    ):
+      patch.start()
+      self.addCleanup(patch.stop)
+    self.saved_filters = self.state / "filters.txt"
+    filters = mock.patch.object(mod, "FILTERS_PATH", self.saved_filters)
+    filters.start()
+    self.addCleanup(filters.stop)
+
+
+class FoldersPayloadTests(PayloadCase):
+  """A folder that is still selected but no longer in the Drive listing."""
+
+  def setUp(self):
+    super().setUp()
+    (self.folder / "Gone").mkdir()
+    (self.folder / "Gone" / "f").write_text("x" * 10)
+    (self.folder / "Old").mkdir()
+    (self.folder / "Old" / "f").write_text("x" * 5)
+    mod.save_selection({"folders": ["Gone"], "rootFiles": True})
+
+  def payload(self, names):
+    with mock.patch.object(mod, "remote_folders", return_value=(names, "")):
+      return mod.folders_payload("gdrive", str(self.folder))
+
+  def test_a_selected_folder_missing_from_drive_stays_selected_and_is_not_stale(self):
+    payload = self.payload(["Other"])
+    by_name = {row["name"]: row for row in payload["folders"]}
+    self.assertTrue(by_name["Gone"]["selected"])
+    self.assertTrue(by_name["Gone"]["missing"])
+    self.assertFalse(by_name["Gone"]["stale"])
+    self.assertFalse(by_name["Old"]["selected"])
+    self.assertTrue(by_name["Old"]["stale"])
+    # Only the deselected folder is "still on disk because you stopped syncing".
+    self.assertEqual(payload["staleBytes"], 5)
+    self.assertEqual(payload["staleCount"], 1)
+
+  def test_a_selected_folder_that_is_listed_is_a_normal_row(self):
+    payload = self.payload(["Gone"])
+    row = {row["name"]: row for row in payload["folders"]}["Gone"]
+    self.assertTrue(row["selected"])
+    self.assertTrue(row["onDisk"])
+    self.assertNotIn("missing", row)
+    self.assertEqual(payload["staleCount"], 1)   # Old, deselected
+
+  def test_loose_files_only_count_when_root_files_are_not_synced(self):
+    (self.folder / "loose.txt").write_text("x" * 7)
+    payload = self.payload(["Other"])
+    self.assertEqual((payload["rootLocalBytes"], payload["rootLocalCount"]), (0, 0))
+    mod.save_selection({"folders": ["Gone"], "rootFiles": False})
+    payload = self.payload(["Other"])
+    self.assertEqual((payload["rootLocalBytes"], payload["rootLocalCount"]), (7, 1))
+    self.assertEqual(payload["staleBytes"], 5 + 7)
+    self.assertEqual(payload["staleCount"], 2)
+
+
+class UnitDriftTests(PayloadCase):
+  def test_units_follow_the_configured_folder_and_are_written_only_on_change(self):
+    with mock.patch.object(mod, "run") as runner:
+      mod.ensure_units("gdrive", self.home / "One", self.home / "Browse")
+      self.assertEqual(runner.call_count, 1)          # one daemon-reload after the batch
+      service = (self.units / mod.SERVICE).read_text()
+      self.assertIn(str(self.home / "One"), service)
+      mod.ensure_units("gdrive", self.home / "One", self.home / "Browse")
+      self.assertEqual(runner.call_count, 1)          # unchanged: no reload
+      mod.ensure_units("gdrive", self.home / "Two", self.home / "Browse")
+      self.assertEqual(runner.call_count, 2)
+      self.assertIn(str(self.home / "Two"), (self.units / mod.SERVICE).read_text())
+
+  def test_the_status_poll_carries_a_changed_folder_into_the_units(self):
+    # Units were installed with the old path; the poll has to notice.
+    with mock.patch.object(mod, "run", return_value=(0, "", "")):
+      mod.ensure_units("gdrive", self.home / "Old", self.home / "Browse")
+    with mock.patch.object(mod, "configured_remotes", return_value=({"gdrive"}, "")), \
+         mock.patch.object(mod, "mount_info", return_value=(False, False, "", True)), \
+         mock.patch.object(mod, "unit_enabled", return_value=False), \
+         mock.patch.object(mod, "timer_enabled", return_value=False), \
+         mock.patch.object(mod, "service_active", return_value=False), \
+         mock.patch.object(mod, "storage_usage", return_value=(0, 0, False, "")), \
+         mock.patch.object(mod, "run", return_value=(0, "", "")):
+      mod.status_payload("gdrive", str(self.home / "New"), str(self.home / "Browse"))
+    # Without a button press: the timer must not keep syncing the old path.
+    self.assertIn(str(self.home / "New"), (self.units / mod.SERVICE).read_text())
+
+  def test_a_status_poll_does_not_install_units_by_itself(self):
+    with mock.patch.object(mod, "configured_remotes", return_value=({"gdrive"}, "")), \
+         mock.patch.object(mod, "mount_info", return_value=(False, False, "", True)), \
+         mock.patch.object(mod, "unit_enabled", return_value=False), \
+         mock.patch.object(mod, "timer_enabled", return_value=False), \
+         mock.patch.object(mod, "service_active", return_value=False), \
+         mock.patch.object(mod, "storage_usage", return_value=(0, 0, False, "")), \
+         mock.patch.object(mod, "run", return_value=(0, "", "")):
+      mod.status_payload("gdrive", str(self.folder), str(self.home / "Browse"))
+    self.assertFalse(self.units.exists())
+
+  def test_the_interval_drop_in_is_rewritten_only_when_it_changes(self):
+    with mock.patch.object(mod, "run") as runner:
+      self.assertTrue(mod.write_timer_interval(25))
+      self.assertEqual(runner.call_count, 1)
+      path = self.units / (mod.TIMER + ".d") / "interval.conf"
+      self.assertIn("OnUnitInactiveSec=25min", path.read_text())
+      self.assertFalse(mod.write_timer_interval(25))
+      self.assertEqual(runner.call_count, 1)          # no write, no daemon-reload
+      self.assertTrue(mod.write_timer_interval(40))
+      self.assertEqual(runner.call_count, 2)
+      self.assertIn("OnUnitInactiveSec=40min", path.read_text())
+
+  def test_the_status_poll_applies_the_interval_when_the_timer_is_on(self):
+    with mock.patch.object(mod, "configured_remotes", return_value=({"gdrive"}, "")), \
+         mock.patch.object(mod, "mount_info", return_value=(False, False, "", True)), \
+         mock.patch.object(mod, "unit_enabled", return_value=False), \
+         mock.patch.object(mod, "timer_enabled", return_value=True), \
+         mock.patch.object(mod, "service_active", return_value=False), \
+         mock.patch.object(mod, "storage_usage", return_value=(0, 0, False, "")), \
+         mock.patch.object(mod, "run", return_value=(0, "", "")):
+      mod.status_payload("gdrive", str(self.folder), str(self.home / "Browse"), 15)
+      path = self.units / (mod.TIMER + ".d") / "interval.conf"
+      self.assertIn("OnUnitInactiveSec=15min", path.read_text())
+
+
+class CleanupLockTests(TempDirCase):
+  def setUp(self):
+    super().setUp()
+    self.home = self.tmp / "home"
+    self.folder = self.home / "Google Drive"
+    (self.folder / "Drop").mkdir(parents=True)
+    (self.folder / "Drop" / "f").write_text("d" * 4)
+    self.rclone = self.tmp / "rclone"
+    self.rclone.write_text(FAKE_RCLONE)
+    self.rclone.chmod(0o755)
+    self.state = self.tmp / "state"
+    for patch in (
+      mock.patch.object(mod.Path, "home", return_value=self.home),
+      mock.patch.object(mod, "rclone_bin", return_value=str(self.rclone)),
+      mock.patch.object(mod, "SELECTION_PATH", self.state / "selection.json"),
+      mock.patch.object(mod, "LOCK_PATH", self.state / "sync.lock"),
+      mock.patch.dict(os.environ, {"FAKE_LOG": str(self.tmp / "log"), "FAKE_SWAP": "", "FAKE_FAIL": ""}),
+    ):
+      patch.start()
+      self.addCleanup(patch.stop)
+    mod.save_selection({"folders": [], "rootFiles": True})
+
+  def args(self):
+    return Namespace(remote="gdrive", folder=str(self.folder), only=[])
+
+  def test_a_running_sync_blocks_cleanup(self):
+    with mod.open_lock_file(mod.LOCK_PATH) as held:
+      fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+      with self.assertRaises(RuntimeError) as caught:
+        mod.cmd_cleanup(self.args())
+    self.assertIn("a sync is running", str(caught.exception))
+    self.assertTrue((self.folder / "Drop" / "f").exists())
+
+  def test_the_tree_is_emptied_while_the_lock_is_held(self):
+    real = mod.remove_tree_contents
+    seen = []
+
+    def spy(dfd, dev, tally=None):
+      other = mod.open_lock_file(mod.LOCK_PATH)
+      try:
+        try:
+          fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+          seen.append("free")
+        except OSError:
+          seen.append("held")
+      finally:
+        other.close()
+      return real(dfd, dev, tally)
+
+    with mock.patch.object(mod, "remove_tree_contents", spy), \
+         contextlib.redirect_stdout(io.StringIO()):
+      self.assertEqual(mod.cmd_cleanup(self.args()), 0)
+    self.assertEqual(seen, ["held"])   # nothing can write into it mid-removal
+
+  def test_a_partial_removal_is_reported_as_such(self):
+    with mock.patch.object(mod.os, "rmdir", side_effect=OSError(13, "no")), \
+         contextlib.redirect_stdout(io.StringIO()) as out, \
+         contextlib.redirect_stderr(io.StringIO()):
+      self.assertEqual(mod.cmd_cleanup(self.args()), 1)
+    refused = mod.json.loads(out.getvalue())["refused"]
+    self.assertIn("no", refused[0]["reason"])
+    self.assertTrue(refused[0]["partial"])
+    self.assertFalse((self.folder / "Drop" / "f").exists())   # gone, as reported
+    self.assertTrue((self.folder / "Drop").exists())
+
+  def test_a_failure_inside_nested_directories_still_counts_as_partial(self):
+    nested = self.folder / "Drop" / "sub"
+    nested.mkdir()
+    (nested / "deep").write_text("d")
+    real = mod.os.rmdir
+
+    def fail_inside(path, *args, **kwargs):
+      if str(path) == "sub":
+        raise OSError(13, "no")
+      return real(path, *args, **kwargs)
+
+    with mock.patch.object(mod.os, "rmdir", side_effect=fail_inside), \
+         contextlib.redirect_stdout(io.StringIO()) as out, \
+         contextlib.redirect_stderr(io.StringIO()):
+      self.assertEqual(mod.cmd_cleanup(self.args()), 1)
+    refused = mod.json.loads(out.getvalue())["refused"]
+    self.assertEqual(refused[0]["name"], "Drop")
+    self.assertTrue(refused[0]["partial"])   # deep had already been deleted
+    self.assertFalse((nested / "deep").exists())
+
+
+class CleanupFileTests(TempDirCase):
+  def setUp(self):
+    super().setUp()
+    self.home = self.tmp / "home"
+    self.folder = self.home / "Google Drive"
+    self.folder.mkdir(parents=True)
+    self.loose = self.folder / "loose.txt"
+    self.loose.write_text("x" * 9)
+    (self.folder / "nested").mkdir()
+    (self.folder / "nested" / "f").write_text("x")
+    self.log = self.tmp / "rclone.log"
+    self.rclone = self.tmp / "rclone"
+    self.rclone.write_text(FAKE_RCLONE)
+    self.rclone.chmod(0o755)
+    self.state = self.tmp / "state"
+    for patch in (
+      mock.patch.object(mod.Path, "home", return_value=self.home),
+      mock.patch.object(mod, "rclone_bin", return_value=str(self.rclone)),
+      mock.patch.object(mod, "SELECTION_PATH", self.state / "selection.json"),
+      mock.patch.object(mod, "LOCK_PATH", self.state / "sync.lock"),
+      mock.patch.dict(os.environ, {"FAKE_LOG": str(self.log), "FAKE_SWAP": "", "FAKE_FAIL": ""}),
+    ):
+      patch.start()
+      self.addCleanup(patch.stop)
+    mod.save_selection({"folders": ["nested"], "rootFiles": False})
+
+  def cleanup(self):
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+      code = mod.cmd_cleanup(Namespace(remote="gdrive", folder=str(self.folder), only=[]))
+    return code, mod.json.loads(out.getvalue())
+
+  def test_a_deselected_loose_file_is_verified_then_removed(self):
+    code, result = self.cleanup()
+    self.assertEqual(code, 0)
+    self.assertEqual(result["removed"], ["loose.txt"])
+    self.assertEqual(result["freedBytes"], 9)
+    self.assertFalse(self.loose.exists())
+    lines = self.log.read_text().splitlines()
+    argv, resolved = lines[:-1], lines[-1]   # the fake ends by resolving $2
+    self.assertEqual(resolved, str(self.folder))
+    self.assertEqual(argv[0], "check")
+    self.assertIn("--drive-skip-gdocs", argv)
+    self.assertEqual(argv[argv.index("--filter"):], ["--filter", "+ /loose.txt", "--filter", "- **"])
+    self.assertEqual(argv[2], "gdrive:")   # the root of the Drive
+    self.assertTrue((self.folder / "nested" / "f").exists())
+
+  def test_a_failed_check_keeps_the_file(self):
+    os.environ["FAKE_FAIL"] = "1"
+    code, result = self.cleanup()
+    self.assertEqual(code, 1)
+    self.assertEqual(result["removed"], [])
+    self.assertTrue(self.loose.exists())
+
+  def test_files_are_left_alone_while_root_files_are_synced(self):
+    mod.save_selection({"folders": ["nested"], "rootFiles": True})
+    code, result = self.cleanup()
+    self.assertEqual(code, 0)
+    self.assertNotIn("loose.txt", result["removed"])
+    self.assertTrue(self.loose.exists())
+
+
+class ErrorPayloadTests(PayloadCase):
+  def test_a_failing_status_still_tells_the_panel_what_is_installed(self):
+    argv = ["gdrive-sync.py", "status", "--folder", "/mnt/elsewhere", "--interval", "10"]
+    out = io.StringIO()
+    with mock.patch.object(sys, "argv", argv), \
+         mock.patch.object(mod, "STATE_DIR", self.state), \
+         mock.patch.object(mod, "WORKDIR", self.state / "workdir"), \
+         contextlib.redirect_stdout(out):
+      self.assertEqual(mod.main(), 0)
+    payload = mod.json.loads(out.getvalue())
+    self.assertFalse(payload["ok"])
+    self.assertTrue(payload["installed"])          # rclone is not the problem
+    self.assertEqual(payload["statusText"], "Unavailable")
+    self.assertIn("inside your home directory", payload["lastError"])
+    for key in ("authenticated", "syncing", "folderPath", "mountPath", "selectedCount",
+                "localBytes", "browseMounted", "timerEnabled", "baseline", "warning"):
+      self.assertIn(key, payload)
+
+  def test_a_failing_folder_listing_keeps_its_shape(self):
+    argv = ["gdrive-sync.py", "folders", "--folder", "/mnt/elsewhere"]
+    out = io.StringIO()
+    with mock.patch.object(sys, "argv", argv), \
+         mock.patch.object(mod, "STATE_DIR", self.state), \
+         mock.patch.object(mod, "WORKDIR", self.state / "workdir"), \
+         contextlib.redirect_stdout(out):
+      self.assertEqual(mod.main(), 0)
+    payload = mod.json.loads(out.getvalue())
+    self.assertEqual(payload["ok"], False)
+    self.assertEqual(payload["folders"], [])
+
+
+class BrowseToggleTests(TempDirCase):
+  def setUp(self):
+    super().setUp()
+    self.home = self.tmp / "home"
+    self.home.mkdir()
+    self.calls = []
+    for patch in (
+      mock.patch.object(mod.Path, "home", return_value=self.home),
+      mock.patch.object(mod, "units_from_args", return_value=None),
+      mock.patch.object(mod, "unit_enabled", return_value=True),
+    ):
+      patch.start()
+      self.addCleanup(patch.stop)
+
+  def browse(self, enable=True, live=False, after_live=None):
+    def fake_run(command, *args, **kwargs):
+      self.calls.append(command)
+      return 0, "", ""
+    states = [live] if after_live is None else [live, after_live]
+    with mock.patch.object(mod, "run", fake_run), \
+         mock.patch.object(mod, "browse_live", side_effect=lambda path: states.pop(0) if states else live), \
+         contextlib.redirect_stdout(io.StringIO()):
+      args = Namespace(remote="gdrive", folder=str(self.home / "Drive"),
+                       mount=str(self.home / "Browse"), enable=enable, disable=not enable)
+      mod.cmd_browse(args)
+
+  def test_an_enabled_unit_with_a_dead_mount_is_restarted(self):
+    self.browse(enable=True, live=False, after_live=True)   # unit enabled, dead mount -> restart
+    self.assertEqual(self.calls, [["systemctl", "--user", "restart", mod.BROWSE_SERVICE]])
+
+  def test_a_disabled_unit_is_enabled_and_started(self):
+    with mock.patch.object(mod, "unit_enabled", return_value=False):
+      self.browse(enable=True, live=True)
+    self.assertEqual(self.calls, [["systemctl", "--user", "enable", "--now", mod.BROWSE_SERVICE]])
+
+  def test_a_mount_that_never_appears_is_an_error(self):
+    with self.assertRaises(RuntimeError) as caught:
+      self.browse(enable=True, live=False, after_live=False)
+    self.assertIn("did not come up", str(caught.exception))
+
+
+class QmlWatchdogTests(unittest.TestCase):
+  """The panel must not kill work the backend is still allowed to do."""
+
+  def interval(self, name):
+    text = (ROOT / "Service.qml").read_text(encoding="utf-8")
+    block = text.split(f"id: {name}", 1)[1].split("\n  }", 1)[0]
+    return int(re.search(r"interval:\s*(\d+)", block).group(1))
+
+  def test_status_and_folders_watchdogs_outlast_the_backend(self):
+    # status: listremotes 10 + findmnt 2x8 + systemctl 3x6 + about 25 + walk 2
+    #         + unit rewrite up to 30 + 25
+    self.assertGreater(self.interval("statusWatchdog"), 126 * 1000)
+    # folders: lsjson 90 + size 90 + walk 2
+    self.assertGreater(self.interval("foldersWatchdog"), 182 * 1000)
+
+  def test_the_control_watchdog_outlasts_a_bounded_cleanup(self):
+    self.assertGreaterEqual(self.interval("controlWatchdog"), (mod.CLEANUP_TIMEOUT + 600) * 1000)

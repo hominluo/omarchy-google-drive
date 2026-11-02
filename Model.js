@@ -110,6 +110,7 @@ function folderSummary(status) {
 function folderMeta(folder) {
   if (!folder) return ""
   var bytes = (folder.approx ? "≈ " : "") + formatBytes(folder.localBytes)
+  if (folder.missing) return "Not in Drive · " + bytes + " on disk"
   if (folder.stale) return "No longer syncing · " + bytes
   if (folder.selected) return folder.onDisk ? bytes + " on disk" : "Waiting for first sync"
   return "Not synced"
@@ -120,10 +121,13 @@ function folderGlyph(folder) {
 }
 
 // The loose files at the very top of Drive, which belong to no folder.
-function rootFilesMeta(count, bytes) {
+function rootFilesMeta(count, bytes, localCount, localBytes) {
   var n = Number(count || 0)
-  if (n <= 0) return "Files that sit in no folder"
-  return n + (n === 1 ? " file" : " files") + " · " + formatBytes(bytes)
+  var have = Number(localCount || 0)
+  var onDisk = Number(localBytes || 0)
+  var kept = have > 0 ? " · " + formatBytes(onDisk) + " on disk" : ""
+  if (n <= 0) return have > 0 ? have + (have === 1 ? " file" : " files") + kept : "Files that sit in no folder"
+  return n + (n === 1 ? " file" : " files") + " · " + formatBytes(bytes) + kept
 }
 
 function shortHomePath(path, home) {
