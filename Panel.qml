@@ -408,12 +408,16 @@ Panel {
               }
 
               Button {
-                text: "Clean up"
+                text: drive.cleaning ? "Cleaning…" : (drive.cleanupQueued ? "Queued" : "Clean up")
                 iconText: "󰩹"
-                enabled: !drive.busy
+                enabled: !drive.busy || drive.cleanupQueued
                 foreground: root.foreground
                 fontFamily: root.fontFamily
-                tooltipText: "Verify each file still exists in Drive, then delete the local copy  (c)"
+                tooltipText: drive.cleanupQueued
+                  ? "Queued until the running sync or command finishes; click to cancel  (c)"
+                  : (drive.syncing
+                    ? "A sync is running; clean up will wait for it to finish  (c)"
+                    : "Verify each file still exists in Drive, then delete the local copy  (c)")
                 onClicked: drive.cleanupStale()
               }
             }

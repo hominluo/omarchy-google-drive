@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Clean up no longer fails silently while a sync is running. The button used
+  to stay enabled and the backend's "a sync is running" refusal only flashed
+  in the header for three seconds; a click (or `c`) now queues the cleanup
+  until the sync finishes, and clicking again cancels it. The button reads
+  "Queued" / "Cleaning…" meanwhile, and a successful run reports the space
+  freed.
+
 ## 1.0.3 — 2026-11-01
 
 Correctness fixes from a full review of the backend, the QML front end and the
