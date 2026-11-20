@@ -12,6 +12,10 @@ Item {
   property bool installed: false
   property bool authenticated: false
   property bool syncing: false
+  // A cleanup asked for during a sync waits for it: the backend refuses to
+  // run while the sync lock is held.
+  property bool cleanupQueued: false
+  property bool cleaning: false
   property bool timerEnabled: false
   property bool browseMounted: false
   property bool browseStale: false
@@ -251,15 +255,36 @@ Item {
   }
 
   function cleanupStale() {
-    if (busy || (staleBytes <= 0 && staleCount <= 0)) return
+    if (cleaning) return
+    if (staleBytes <= 0 && staleCount <= 0) { cleanupQueued = false; return }
+    if (syncing || busy) {
+      cleanupQueued = !cleanupQueued
+      note(cleanupQueued ? "Clean up will run when the sync finishes" : "Clean up cancelled")
+      return
+    }
+    cleanupQueued = false
+    cleaning = true
     note("Verifying against Drive before deleting…")
     runControl(baseArgs("cleanup").concat([
       "--remote", remoteName, "--folder", configuredFolder
-    ]), function () {
+    ]), function (exitCode, stdoutText) {
+      root.cleaning = false
+      if (exitCode === 0) {
+        var freed = 0
+        try { freed = Number(JSON.parse(stdoutText).freedBytes) || 0 } catch (e) {}
+        root.note(freed > 0 ? "Freed " + Model.formatBytes(freed) : "Nothing to clean up")
+      }
       root.refreshFolders()
       root.refresh()
     })
   }
+
+  function runQueuedCleanup() {
+    if (cleanupQueued && !syncing && !busy) cleanupStale()
+  }
+
+  onSyncingChanged: Qt.callLater(runQueuedCleanup)
+  onBusyChanged: Qt.callLater(runQueuedCleanup)
 
   function openFolder() {
     if (folderPath !== "") Quickshell.execDetached(["uwsm-app", "--", "nautilus", fileUri(folderPath)])
@@ -378,6 +403,7 @@ Item {
     onTriggered: {
       if (!controlProcess.running) return
       controlProcess.running = false
+      root.cleaning = false
       root._desiredBrowse = -1
       root._desiredTimer = -1
       root.lastError = "The Google Drive command timed out"
@@ -432,7 +458,8 @@ Item {
       }
       var callback = root._onControlDone
       root._onControlDone = null
-      if (callback) Qt.callLater(callback)
+      var stdoutText = String(controlStdout.text || "")
+      if (callback) Qt.callLater(callback, exitCode, stdoutText)
     }
   }
 }
